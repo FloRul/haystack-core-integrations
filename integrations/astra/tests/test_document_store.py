@@ -14,18 +14,30 @@ from haystack.testing.document_store import DocumentStoreBaseTests
 from haystack_integrations.document_stores.astra import AstraDocumentStore
 
 
-def test_namespace_init():
+@pytest.fixture
+def mock_auth(monkeypatch):
+    monkeypatch.setenv("ASTRA_DB_API_ENDPOINT", "http://example.com")
+    monkeypatch.setenv("ASTRA_DB_APPLICATION_TOKEN", "test_token")
+
+
+@mock.patch("haystack_integrations.document_stores.astra.astra_client.AstraDB")
+def test_init_is_lazy(_mock_client, mock_auth):  # noqa
+    _ = AstraDocumentStore()
+    _mock_client.assert_not_called()
+
+
+def test_namespace_init(mock_auth):  # noqa
     with mock.patch("haystack_integrations.document_stores.astra.astra_client.AstraDB") as client:
-        AstraDocumentStore()
+        _ = AstraDocumentStore().index
         assert "namespace" in client.call_args.kwargs
         assert client.call_args.kwargs["namespace"] is None
 
-        AstraDocumentStore(namespace="foo")
+        _ = AstraDocumentStore(namespace="foo").index
         assert "namespace" in client.call_args.kwargs
         assert client.call_args.kwargs["namespace"] == "foo"
 
 
-def test_to_dict():
+def test_to_dict(mock_auth):  # noqa
     with mock.patch("haystack_integrations.document_stores.astra.astra_client.AstraDB"):
         ds = AstraDocumentStore()
         result = ds.to_dict()
@@ -159,6 +171,34 @@ class TestDocumentStore(DocumentStoreBaseTests):
 
         # No Document has been deleted
         assert document_store.count_documents() == 0
+
+    def test_filter_documents_nested_filters(self, document_store, filterable_docs):
+        filter_criteria = {
+            "operator": "AND",
+            "conditions": [
+                {"field": "meta.page", "operator": "==", "value": "100"},
+                {
+                    "operator": "OR",
+                    "conditions": [
+                        {"field": "meta.chapter", "operator": "==", "value": "abstract"},
+                        {"field": "meta.chapter", "operator": "==", "value": "intro"},
+                    ],
+                },
+            ],
+        }
+
+        document_store.write_documents(filterable_docs)
+        result = document_store.filter_documents(filters=filter_criteria)
+
+        self.assert_documents_are_equal(
+            result,
+            [
+                d
+                for d in filterable_docs
+                if d.meta.get("page") == "100"
+                and (d.meta.get("chapter") == "abstract" or d.meta.get("chapter") == "intro")
+            ],
+        )
 
     @pytest.mark.skip(reason="Unsupported filter operator not.")
     def test_not_operator(self, document_store, filterable_docs):

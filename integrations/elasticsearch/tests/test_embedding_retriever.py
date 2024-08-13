@@ -3,7 +3,9 @@
 # SPDX-License-Identifier: Apache-2.0
 from unittest.mock import Mock, patch
 
+import pytest
 from haystack.dataclasses import Document
+from haystack.document_stores.types import FilterPolicy
 from haystack_integrations.components.retrievers.elasticsearch import ElasticsearchEmbeddingRetriever
 from haystack_integrations.document_stores.elasticsearch import ElasticsearchDocumentStore
 
@@ -15,6 +17,12 @@ def test_init_default():
     assert retriever._filters == {}
     assert retriever._top_k == 10
     assert retriever._num_candidates is None
+
+    retriever = ElasticsearchEmbeddingRetriever(document_store=mock_store, filter_policy="replace")
+    assert retriever._filter_policy == FilterPolicy.REPLACE
+
+    with pytest.raises(ValueError):
+        ElasticsearchEmbeddingRetriever(document_store=mock_store, filter_policy="keep")
 
 
 @patch("haystack_integrations.document_stores.elasticsearch.document_store.Elasticsearch")
@@ -29,6 +37,7 @@ def test_to_dict(_mock_elasticsearch_client):
             "document_store": {
                 "init_parameters": {
                     "hosts": "some fake host",
+                    "custom_mapping": None,
                     "index": "default",
                     "embedding_similarity_function": "cosine",
                 },
@@ -36,6 +45,7 @@ def test_to_dict(_mock_elasticsearch_client):
             },
             "filters": {},
             "top_k": 10,
+            "filter_policy": "replace",
             "num_candidates": None,
         },
     }
@@ -43,6 +53,29 @@ def test_to_dict(_mock_elasticsearch_client):
 
 @patch("haystack_integrations.document_stores.elasticsearch.document_store.Elasticsearch")
 def test_from_dict(_mock_elasticsearch_client):
+    t = "haystack_integrations.components.retrievers.elasticsearch.embedding_retriever.ElasticsearchEmbeddingRetriever"
+    data = {
+        "type": t,
+        "init_parameters": {
+            "document_store": {
+                "init_parameters": {"hosts": "some fake host", "index": "default"},
+                "type": "haystack_integrations.document_stores.elasticsearch.document_store.ElasticsearchDocumentStore",
+            },
+            "filters": {},
+            "top_k": 10,
+            "filter_policy": "replace",
+            "num_candidates": None,
+        },
+    }
+    retriever = ElasticsearchEmbeddingRetriever.from_dict(data)
+    assert retriever._document_store
+    assert retriever._filters == {}
+    assert retriever._top_k == 10
+    assert retriever._num_candidates is None
+
+
+@patch("haystack_integrations.document_stores.elasticsearch.document_store.Elasticsearch")
+def test_from_dict_no_filter_policy(_mock_elasticsearch_client):
     t = "haystack_integrations.components.retrievers.elasticsearch.embedding_retriever.ElasticsearchEmbeddingRetriever"
     data = {
         "type": t,
@@ -61,6 +94,7 @@ def test_from_dict(_mock_elasticsearch_client):
     assert retriever._filters == {}
     assert retriever._top_k == 10
     assert retriever._num_candidates is None
+    assert retriever._filter_policy == FilterPolicy.REPLACE  # defaults to REPLACE
 
 
 def test_run():

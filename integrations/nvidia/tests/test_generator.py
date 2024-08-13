@@ -2,11 +2,39 @@
 #
 # SPDX-License-Identifier: Apache-2.0
 import os
-from unittest.mock import Mock, patch
 
 import pytest
 from haystack.utils import Secret
 from haystack_integrations.components.generators.nvidia import NvidiaGenerator
+from requests_mock import Mocker
+
+
+@pytest.fixture
+def mock_local_chat_completion(requests_mock: Mocker) -> None:
+    requests_mock.post(
+        "http://localhost:8080/v1/chat/completions",
+        json={
+            "choices": [
+                {
+                    "message": {"content": "Hello!", "role": "system"},
+                    "usage": {"prompt_tokens": 3, "total_tokens": 5, "completion_tokens": 9},
+                    "finish_reason": "stop",
+                    "index": 0,
+                },
+                {
+                    "message": {"content": "How are you?", "role": "system"},
+                    "usage": {"prompt_tokens": 3, "total_tokens": 5, "completion_tokens": 9},
+                    "finish_reason": "stop",
+                    "index": 1,
+                },
+            ],
+            "usage": {
+                "prompt_tokens": 3,
+                "total_tokens": 5,
+                "completion_tokens": 9,
+            },
+        },
+    )
 
 
 class TestNvidiaGenerator:
@@ -55,7 +83,7 @@ class TestNvidiaGenerator:
         assert data == {
             "type": "haystack_integrations.components.generators.nvidia.generator.NvidiaGenerator",
             "init_parameters": {
-                "api_url": None,
+                "api_url": "https://integrate.api.nvidia.com/v1",
                 "api_key": {"env_vars": ["NVIDIA_API_KEY"], "strict": True, "type": "env_var"},
                 "model": "playground_nemotron_steerlm_8b",
                 "model_arguments": {},
@@ -81,7 +109,7 @@ class TestNvidiaGenerator:
             "type": "haystack_integrations.components.generators.nvidia.generator.NvidiaGenerator",
             "init_parameters": {
                 "api_key": {"env_vars": ["NVIDIA_API_KEY"], "strict": True, "type": "env_var"},
-                "api_url": "https://my.url.com",
+                "api_url": "https://my.url.com/v1",
                 "model": "playground_nemotron_steerlm_8b",
                 "model_arguments": {
                     "temperature": 0.2,
@@ -93,92 +121,6 @@ class TestNvidiaGenerator:
                 },
             },
         }
-
-    @patch("haystack_integrations.components.generators.nvidia._nvcf_backend.NvidiaCloudFunctionsClient")
-    def test_run(self, mock_client_class):
-        generator = NvidiaGenerator(
-            model="playground_nemotron_steerlm_8b",
-            api_key=Secret.from_token("fake-api-key"),
-            model_arguments={
-                "temperature": 0.2,
-                "top_p": 0.7,
-                "max_tokens": 1024,
-                "seed": None,
-                "bad": None,
-                "stop": None,
-            },
-        )
-        mock_client = Mock(
-            get_model_nvcf_id=Mock(return_value="some_id"),
-            query_function=Mock(
-                return_value={
-                    "id": "some_id",
-                    "choices": [
-                        {
-                            "index": 0,
-                            "message": {"content": "42", "role": "assistant"},
-                            "finish_reason": "stop",
-                        }
-                    ],
-                    "usage": {"total_tokens": 21, "prompt_tokens": 19, "completion_tokens": 2},
-                }
-            ),
-        )
-        mock_client_class.return_value = mock_client
-        generator.warm_up()
-
-        result = generator.run(prompt="What is the answer?")
-        mock_client.query_function.assert_called_once_with(
-            "some_id",
-            {
-                "messages": [
-                    {"content": "What is the answer?", "role": "user"},
-                ],
-                "temperature": 0.2,
-                "top_p": 0.7,
-                "max_tokens": 1024,
-                "seed": None,
-                "bad": None,
-                "stop": None,
-            },
-        )
-        assert result == {
-            "replies": ["42"],
-            "meta": [
-                {
-                    "finish_reason": "stop",
-                    "role": "assistant",
-                    "usage": {
-                        "total_tokens": 21,
-                        "prompt_tokens": 19,
-                        "completion_tokens": 2,
-                    },
-                },
-            ],
-        }
-
-    @pytest.mark.skipif(
-        not os.environ.get("NVIDIA_API_KEY", None),
-        reason="Export an env var called NVIDIA_API_KEY containing the Nvidia API key to run this test.",
-    )
-    @pytest.mark.integration
-    def test_run_integration_with_nvcf_backend(self):
-        generator = NvidiaGenerator(
-            model="playground_nv_llama2_rlhf_70b",
-            model_arguments={
-                "temperature": 0.2,
-                "top_p": 0.7,
-                "max_tokens": 1024,
-                "seed": None,
-                "bad": None,
-                "stop": None,
-            },
-        )
-        generator.warm_up()
-        result = generator.run(prompt="What is the answer?")
-
-        assert result["replies"]
-        assert result["meta"]
 
     @pytest.mark.skipif(
         not os.environ.get("NVIDIA_NIM_GENERATOR_MODEL", None) or not os.environ.get("NVIDIA_NIM_ENDPOINT_URL", None),
@@ -202,3 +144,73 @@ class TestNvidiaGenerator:
 
         assert result["replies"]
         assert result["meta"]
+
+    @pytest.mark.integration
+    @pytest.mark.usefixtures("mock_local_models")
+    @pytest.mark.usefixtures("mock_local_chat_completion")
+    def test_run_integration_with_default_model_nim_backend(self):
+        model = None
+        url = "http://localhost:8080/v1"
+        generator = NvidiaGenerator(
+            model=model,
+            api_url=url,
+            api_key=None,
+            model_arguments={
+                "temperature": 0.2,
+            },
+        )
+        with pytest.warns(UserWarning) as record:
+            generator.warm_up()
+        assert len(record) == 1
+        assert "Default model is set as:" in str(record[0].message)
+        assert generator._model == "model1"
+        assert not generator.is_hosted
+
+        result = generator.run(prompt="What is the answer?")
+
+        assert result["replies"]
+        assert result["meta"]
+
+    @pytest.mark.skipif(
+        not os.environ.get("NVIDIA_API_KEY", None),
+        reason="Export an env var called NVIDIA_API_KEY containing the NVIDIA API key to run this test.",
+    )
+    @pytest.mark.integration
+    def test_run_integration_with_api_catalog(self):
+        generator = NvidiaGenerator(
+            model="meta/llama3-70b-instruct",
+            api_url="https://integrate.api.nvidia.com/v1",
+            api_key=Secret.from_env_var("NVIDIA_API_KEY"),
+            model_arguments={
+                "temperature": 0.2,
+            },
+        )
+        generator.warm_up()
+        result = generator.run(prompt="What is the answer?")
+
+        assert result["replies"]
+        assert result["meta"]
+
+    def test_local_nim_without_key(self) -> None:
+        generator = NvidiaGenerator(
+            model="BOGUS",
+            api_url="http://localhost:8000",
+            api_key=None,
+        )
+        generator.warm_up()
+
+    def test_hosted_nim_without_key(self):
+        generator0 = NvidiaGenerator(
+            model="BOGUS",
+            api_url="https://integrate.api.nvidia.com/v1",
+            api_key=None,
+        )
+        with pytest.raises(ValueError):
+            generator0.warm_up()
+
+        generator1 = NvidiaGenerator(
+            model="BOGUS",
+            api_key=None,
+        )
+        with pytest.raises(ValueError):
+            generator1.warm_up()

@@ -63,6 +63,7 @@ class ElasticsearchDocumentStore:
         self,
         *,
         hosts: Optional[Hosts] = None,
+        custom_mapping: Optional[Dict[str, Any]] = None,
         index: str = "default",
         embedding_similarity_function: Literal["cosine", "dot_product", "l2_norm", "max_inner_product"] = "cosine",
         **kwargs,
@@ -82,6 +83,7 @@ class ElasticsearchDocumentStore:
         [reference](https://elasticsearch-py.readthedocs.io/en/stable/api.html#module-elasticsearch)
 
         :param hosts: List of hosts running the Elasticsearch client.
+        :param custom_mapping: Custom mapping for the index. If not provided, a default mapping will be used.
         :param index: Name of index in Elasticsearch.
         :param embedding_similarity_function: The similarity function used to compare Documents embeddings.
             This parameter only takes effect if the index does not yet exist and is created.
@@ -91,40 +93,60 @@ class ElasticsearchDocumentStore:
         :param **kwargs: Optional arguments that `Elasticsearch` takes.
         """
         self._hosts = hosts
-        self._client = Elasticsearch(
-            hosts,
-            headers={"user-agent": f"haystack-py-ds/{haystack_version}"},
-            **kwargs,
-        )
+        self._client = None
         self._index = index
         self._embedding_similarity_function = embedding_similarity_function
+        self._custom_mapping = custom_mapping
         self._kwargs = kwargs
 
-        # Check client connection, this will raise if not connected
-        self._client.info()
+        if self._custom_mapping and not isinstance(self._custom_mapping, Dict):
+            msg = "custom_mapping must be a dictionary"
+            raise ValueError(msg)
 
-        # configure mapping for the embedding field
-        mappings = {
-            "properties": {
-                "embedding": {"type": "dense_vector", "index": True, "similarity": embedding_similarity_function},
-                "content": {"type": "text"},
-            },
-            "dynamic_templates": [
-                {
-                    "strings": {
-                        "path_match": "*",
-                        "match_mapping_type": "string",
-                        "mapping": {
-                            "type": "keyword",
+    @property
+    def client(self) -> Elasticsearch:
+        if self._client is None:
+            client = Elasticsearch(
+                self._hosts,
+                headers={"user-agent": f"haystack-py-ds/{haystack_version}"},
+                **self._kwargs,
+            )
+            # Check client connection, this will raise if not connected
+            client.info()
+
+            if self._custom_mapping:
+                mappings = self._custom_mapping
+            else:
+                # Configure mapping for the embedding field if none is provided
+                mappings = {
+                    "properties": {
+                        "embedding": {
+                            "type": "dense_vector",
+                            "index": True,
+                            "similarity": self._embedding_similarity_function,
                         },
-                    }
+                        "content": {"type": "text"},
+                    },
+                    "dynamic_templates": [
+                        {
+                            "strings": {
+                                "path_match": "*",
+                                "match_mapping_type": "string",
+                                "mapping": {
+                                    "type": "keyword",
+                                },
+                            }
+                        }
+                    ],
                 }
-            ],
-        }
 
-        # Create the index if it doesn't exist
-        if not self._client.indices.exists(index=index):
-            self._client.indices.create(index=index, mappings=mappings)
+            # Create the index if it doesn't exist
+            if not client.indices.exists(index=self._index):
+                client.indices.create(index=self._index, mappings=mappings)
+
+            self._client = client
+
+        return self._client
 
     def to_dict(self) -> Dict[str, Any]:
         """
@@ -139,6 +161,7 @@ class ElasticsearchDocumentStore:
         return default_to_dict(
             self,
             hosts=self._hosts,
+            custom_mapping=self._custom_mapping,
             index=self._index,
             embedding_similarity_function=self._embedding_similarity_function,
             **self._kwargs,
@@ -161,7 +184,7 @@ class ElasticsearchDocumentStore:
         Returns how many documents are present in the document store.
         :returns: Number of documents in the document store.
         """
-        return self._client.count(index=self._index)["count"]
+        return self.client.count(index=self._index)["count"]
 
     def _search_documents(self, **kwargs) -> List[Document]:
         """
@@ -176,7 +199,7 @@ class ElasticsearchDocumentStore:
         from_ = 0
         # Handle pagination
         while True:
-            res = self._client.search(
+            res = self.client.search(
                 index=self._index,
                 from_=from_,
                 **kwargs,
@@ -250,7 +273,7 @@ class ElasticsearchDocumentStore:
             )
 
         documents_written, errors = helpers.bulk(
-            client=self._client,
+            client=self.client,
             actions=elasticsearch_actions,
             refresh="wait_for",
             index=self._index,
@@ -306,7 +329,7 @@ class ElasticsearchDocumentStore:
         """
 
         helpers.bulk(
-            client=self._client,
+            client=self.client,
             actions=({"_op_type": "delete", "_id": id_} for id_ in document_ids),
             refresh="wait_for",
             index=self._index,

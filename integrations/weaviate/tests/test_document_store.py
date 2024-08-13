@@ -1,4 +1,9 @@
+# SPDX-FileCopyrightText: 2023-present deepset GmbH <info@deepset.ai>
+#
+# SPDX-License-Identifier: Apache-2.0
+
 import base64
+import os
 import random
 from typing import List
 from unittest.mock import MagicMock, patch
@@ -16,6 +21,7 @@ from haystack.testing.document_store import (
     FilterDocumentsTest,
     WriteDocumentsTest,
 )
+from haystack.utils.auth import Secret
 from haystack_integrations.document_stores.weaviate.auth import AuthApiKey
 from haystack_integrations.document_stores.weaviate.document_store import (
     DOCUMENT_COLLECTION_PROPERTIES,
@@ -26,8 +32,6 @@ from numpy import array_equal as np_array_equal
 from numpy import float32 as np_float32
 from pandas import DataFrame
 from weaviate.collections.classes.data import DataObject
-
-# from weaviate.auth import AuthApiKey as WeaviateAuthApiKey
 from weaviate.config import AdditionalConfig, ConnectionConfig, Proxies, Timeout
 from weaviate.embedded import (
     DEFAULT_BINARY_PATH,
@@ -36,6 +40,12 @@ from weaviate.embedded import (
     DEFAULT_PORT,
     EmbeddedOptions,
 )
+
+
+@patch("haystack_integrations.document_stores.weaviate.document_store.weaviate.WeaviateClient")
+def test_init_is_lazy(_mock_client):
+    _ = WeaviateDocumentStore()
+    _mock_client.assert_not_called()
 
 
 @pytest.mark.integration
@@ -57,7 +67,7 @@ class TestWeaviateDocumentStore(CountDocumentsTest, WriteDocumentsTest, DeleteDo
             collection_settings=collection_settings,
         )
         yield store
-        store._client.collections.delete(collection_settings["class"])
+        store.client.collections.delete(collection_settings["class"])
 
     @pytest.fixture
     def filterable_docs(self) -> List[Document]:
@@ -150,12 +160,12 @@ class TestWeaviateDocumentStore(CountDocumentsTest, WriteDocumentsTest, DeleteDo
                 assert received_meta.get(key) == expected_meta.get(key)
 
     @patch("haystack_integrations.document_stores.weaviate.document_store.weaviate.WeaviateClient")
-    def test_init(self, mock_weaviate_client_class, monkeypatch):
+    def test_connection(self, mock_weaviate_client_class, monkeypatch):
         mock_client = MagicMock()
         mock_client.collections.exists.return_value = False
         mock_weaviate_client_class.return_value = mock_client
         monkeypatch.setenv("WEAVIATE_API_KEY", "my_api_key")
-        WeaviateDocumentStore(
+        ds = WeaviateDocumentStore(
             collection_settings={"class": "My_collection"},
             auth_client_secret=AuthApiKey(),
             additional_headers={"X-HuggingFace-Api-Key": "MY_HUGGINGFACE_KEY"},
@@ -170,8 +180,11 @@ class TestWeaviateDocumentStore(CountDocumentsTest, WriteDocumentsTest, DeleteDo
             ),
         )
 
-        # Verify client is created with correct parameters
+        # Trigger the actual database connection by accessing the `client` property so we
+        # can assert the setup was good
+        _ = ds.client
 
+        # Verify client is created with correct parameters
         mock_weaviate_client_class.assert_called_once_with(
             auth_client_secret=AuthApiKey().resolve_value(),
             connection_params=None,
@@ -646,6 +659,15 @@ class TestWeaviateDocumentStore(CountDocumentsTest, WriteDocumentsTest, DeleteDo
         with pytest.raises(ValueError):
             document_store._embedding_retrieval(query_embedding=[], distance=0.1, certainty=0.1)
 
+    def test_filter_documents_with_legacy_filters(self, document_store):
+        docs = []
+        for index in range(10):
+            docs.append(Document(content="This is some content", meta={"index": index}))
+        document_store.write_documents(docs)
+        result = document_store.filter_documents({"content": {"$eq": "This is some content"}})
+
+        assert len(result) == 10
+
     def test_filter_documents_below_default_limit(self, document_store):
         docs = []
         for index in range(9998):
@@ -664,3 +686,39 @@ class TestWeaviateDocumentStore(CountDocumentsTest, WriteDocumentsTest, DeleteDo
         document_store.write_documents(docs)
         with pytest.raises(DocumentStoreError):
             document_store.filter_documents({"field": "content", "operator": "==", "value": "This is some content"})
+
+    def test_schema_class_name_conversion_preserves_pascal_case(self):
+        collection_settings = {"class": "CaseDocument"}
+        doc_score = WeaviateDocumentStore(
+            url="http://localhost:8080",
+            collection_settings=collection_settings,
+        )
+        assert doc_score._collection_settings["class"] == "CaseDocument"
+
+        collection_settings = {"class": "lower_case_name"}
+        doc_score = WeaviateDocumentStore(
+            url="http://localhost:8080",
+            collection_settings=collection_settings,
+        )
+        assert doc_score._collection_settings["class"] == "Lower_case_name"
+
+    @pytest.mark.skipif(
+        not os.environ.get("WEAVIATE_API_KEY", None) and not os.environ.get("WEAVIATE_CLOUD_CLUSTER_URL", None),
+        reason="Both WEAVIATE_API_KEY and WEAVIATE_CLOUD_CLUSTER_URL are not set. Skipping test.",
+    )
+    def test_connect_to_weaviate_cloud(self):
+        document_store = WeaviateDocumentStore(
+            url=os.environ.get("WEAVIATE_CLOUD_CLUSTER_URL"),
+            auth_client_secret=AuthApiKey(api_key=Secret.from_env_var("WEAVIATE_API_KEY")),
+        )
+        assert document_store.client
+
+    def test_connect_to_local(self):
+        document_store = WeaviateDocumentStore(
+            url="http://localhost:8080",
+        )
+        assert document_store.client
+
+    def test_connect_to_embedded(self):
+        document_store = WeaviateDocumentStore(embedded_options=EmbeddedOptions())
+        assert document_store.client

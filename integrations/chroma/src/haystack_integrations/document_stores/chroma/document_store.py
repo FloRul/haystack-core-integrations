@@ -3,7 +3,7 @@
 # SPDX-License-Identifier: Apache-2.0
 import logging
 from collections import defaultdict
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Literal, Optional, Tuple
 
 import chromadb
 import numpy as np
@@ -16,6 +16,10 @@ from .errors import ChromaDocumentStoreFilterError
 from .utils import get_embedding_function
 
 logger = logging.getLogger(__name__)
+
+
+VALID_DISTANCE_FUNCTIONS = "l2", "cosine", "ip"
+SUPPORTED_TYPES_FOR_METADATA_VALUES = str, int, float, bool
 
 
 class ChromaDocumentStore:
@@ -31,6 +35,8 @@ class ChromaDocumentStore:
         collection_name: str = "documents",
         embedding_function: str = "default",
         persist_path: Optional[str] = None,
+        distance_function: Literal["l2", "cosine", "ip"] = "l2",
+        metadata: Optional[dict] = None,
         **embedding_function_params,
     ):
         """
@@ -45,22 +51,59 @@ class ChromaDocumentStore:
         :param collection_name: the name of the collection to use in the database.
         :param embedding_function: the name of the embedding function to use to embed the query
         :param persist_path: where to store the database. If None, the database will be `in-memory`.
+        :param distance_function: The distance metric for the embedding space.
+            - `"l2"` computes the Euclidean (straight-line) distance between vectors,
+            where smaller scores indicate more similarity.
+            - `"cosine"` computes the cosine similarity between vectors,
+            with higher scores indicating greater similarity.
+            - `"ip"` stands for inner product, where higher scores indicate greater similarity between vectors.
+            **Note**: `distance_function` can only be set during the creation of a collection.
+            To change the distance metric of an existing collection, consider cloning the collection.
+        :param metadata: a dictionary of chromadb collection parameters passed directly to chromadb's client
+            method `create_collection`. If it contains the key `"hnsw:space"`, the value will take precedence over the
+            `distance_function` parameter above.
+
         :param embedding_function_params: additional parameters to pass to the embedding function.
         """
+
+        if distance_function not in VALID_DISTANCE_FUNCTIONS:
+            error_message = (
+                f"Invalid distance_function: '{distance_function}' for the collection. "
+                f"Valid options are: {VALID_DISTANCE_FUNCTIONS}."
+            )
+            raise ValueError(error_message)
+
         # Store the params for marshalling
         self._collection_name = collection_name
         self._embedding_function = embedding_function
         self._embedding_function_params = embedding_function_params
         self._persist_path = persist_path
+        self._distance_function = distance_function
         # Create the client instance
         if persist_path is None:
             self._chroma_client = chromadb.Client()
         else:
             self._chroma_client = chromadb.PersistentClient(path=persist_path)
-        self._collection = self._chroma_client.get_or_create_collection(
-            name=collection_name,
-            embedding_function=get_embedding_function(embedding_function, **embedding_function_params),
-        )
+
+        embedding_func = get_embedding_function(embedding_function, **embedding_function_params)
+
+        metadata = metadata or {}
+        if "hnsw:space" not in metadata:
+            metadata["hnsw:space"] = distance_function
+
+        if collection_name in [c.name for c in self._chroma_client.list_collections()]:
+            self._collection = self._chroma_client.get_collection(collection_name, embedding_function=embedding_func)
+
+            if metadata != self._collection.metadata:
+                logger.warning(
+                    "Collection already exists. The `distance_function` and `metadata` parameters will be ignored."
+                )
+        else:
+            self._collection = self._chroma_client.create_collection(
+                name=collection_name,
+                metadata=metadata,
+                embedding_function=embedding_func,
+            )
 
     def count_documents(self) -> int:
         """
@@ -184,7 +227,26 @@ class ChromaDocumentStore:
             data = {"ids": [doc.id], "documents": [doc.content]}
 
             if doc.meta:
-                data["metadatas"] = [doc.meta]
+                valid_meta = {}
+                discarded_keys = []
+
+                for k, v in doc.meta.items():
+                    if isinstance(v, SUPPORTED_TYPES_FOR_METADATA_VALUES):
+                        valid_meta[k] = v
+                    else:
+                        discarded_keys.append(k)
+
+                if discarded_keys:
+                    logger.warning(
+                        "Document %s contains `meta` values of unsupported types for the keys: %s. "
+                        "These items will be discarded. Supported types are: %s.",
+                        doc.id,
+                        ", ".join(discarded_keys),
+                        ", ".join([t.__name__ for t in SUPPORTED_TYPES_FOR_METADATA_VALUES]),
+                    )
+
+                if valid_meta:
+                    data["metadatas"] = [valid_meta]
 
             if doc.embedding is not None:
                 data["embeddings"] = [doc.embedding]
@@ -209,16 +271,30 @@ class ChromaDocumentStore:
         """
         self._collection.delete(ids=document_ids)
 
-    def search(self, queries: List[str], top_k: int) -> List[List[Document]]:
+    def search(self, queries: List[str], top_k: int, filters: Optional[Dict[str, Any]] = None) -> List[List[Document]]:
         """Search the documents in the store using the provided text queries.
 
         :param queries: the list of queries to search for.
         :param top_k: top_k documents to return for each query.
+        :param filters: a dictionary of filters to apply to the search. Accepts filters in haystack format.
         :returns: matching documents for each query.
         """
-        results = self._collection.query(
-            query_texts=queries, n_results=top_k, include=["embeddings", "documents", "metadatas", "distances"]
-        )
+        if filters is None:
+            results = self._collection.query(
+                query_texts=queries,
+                n_results=top_k,
+                include=["embeddings", "documents", "metadatas", "distances"],
+            )
+        else:
+            chroma_filters = self._normalize_filters(filters=filters)
+            results = self._collection.query(
+                query_texts=queries,
+                n_results=top_k,
+                where=chroma_filters[1],
+                where_document=chroma_filters[2],
+                include=["embeddings", "documents", "metadatas", "distances"],
+            )
+
         return self._query_result_to_documents(results)
 
     def search_embeddings(
@@ -276,6 +352,7 @@ class ChromaDocumentStore:
             collection_name=self._collection_name,
             embedding_function=self._embedding_function,
             persist_path=self._persist_path,
+            distance_function=self._distance_function,
             **self._embedding_function_params,
         )
 
@@ -380,8 +457,12 @@ class ChromaDocumentStore:
                 }
 
                 # prepare metadata
-                if metadatas := result.get("metadatas"):
-                    document_dict["meta"] = dict(metadatas[i][j])
+                metadatas = result.get("metadatas")
+                try:
+                    if metadatas and metadatas[i][j] is not None:
+                        document_dict["meta"] = metadatas[i][j]
+                except IndexError:
+                    pass
 
                 if embeddings := result.get("embeddings"):
                     document_dict["embedding"] = np.array(embeddings[i][j])

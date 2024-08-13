@@ -5,7 +5,6 @@ from typing import Any, ClassVar, Dict, Generator, List, Optional, Set, Union
 
 import numpy as np
 import qdrant_client
-from grpc import RpcError
 from haystack import default_from_dict, default_to_dict
 from haystack.dataclasses import Document
 from haystack.dataclasses.sparse_embedding import SparseEmbedding
@@ -50,6 +49,44 @@ def get_batches_from_generator(iterable, n):
 
 
 class QdrantDocumentStore:
+    """
+    QdrantDocumentStore is a Document Store for Qdrant.
+    It can be used with any Qdrant instance: in-memory, disk-persisted, Docker-based,
+    and Qdrant Cloud Cluster deployments.
+
+    Usage example by creating an in-memory instance:
+
+    ```python
+    from haystack.dataclasses.document import Document
+    from haystack_integrations.document_stores.qdrant import QdrantDocumentStore
+
+    document_store = QdrantDocumentStore(
+        ":memory:",
+        recreate_index=True
+    )
+    document_store.write_documents([
+        Document(content="This is first", embedding=[0.0]*5),
+        Document(content="This is second", embedding=[0.1, 0.2, 0.3, 0.4, 0.5])
+    ])
+    ```
+
+    Usage example with Qdrant Cloud:
+
+    ```python
+    from haystack.dataclasses.document import Document
+    from haystack_integrations.document_stores.qdrant import QdrantDocumentStore
+
+    document_store = QdrantDocumentStore(
+            url="https://xxxxxx-xxxxx-xxxxx-xxxx-xxxxxxxxx.us-east.aws.cloud.qdrant.io:6333",
+        api_key="<your-api-key>",
+    )
+    document_store.write_documents([
+        Document(content="This is first", embedding=[0.0]*5),
+        Document(content="This is second", embedding=[0.1, 0.2, 0.3, 0.4, 0.5])
+    ])
+    ```
+    """
+
     SIMILARITY: ClassVar[Dict[str, str]] = {
         "cosine": rest.Distance.COSINE,
         "dot_product": rest.Distance.DOT,
@@ -66,20 +103,18 @@ class QdrantDocumentStore:
         https: Optional[bool] = None,
         api_key: Optional[Secret] = None,
         prefix: Optional[str] = None,
-        timeout: Optional[float] = None,
+        timeout: Optional[int] = None,
         host: Optional[str] = None,
         path: Optional[str] = None,
+        force_disable_check_same_thread: bool = False,
         index: str = "Document",
         embedding_dim: int = 768,
         on_disk: bool = False,
-        content_field: str = "content",
-        name_field: str = "name",
-        embedding_field: str = "embedding",
         use_sparse_embeddings: bool = False,
+        sparse_idf: bool = False,
         similarity: str = "cosine",
         return_embedding: bool = False,
         progress_bar: bool = True,
-        duplicate_documents: str = "overwrite",
         recreate_index: bool = False,
         shard_number: Optional[int] = None,
         replication_factor: Optional[int] = None,
@@ -96,23 +131,94 @@ class QdrantDocumentStore:
         scroll_size: int = 10_000,
         payload_fields_to_index: Optional[List[dict]] = None,
     ):
-        super().__init__()
+        """
+        :param location:
+            If `memory` - use in-memory Qdrant instance.
+            If `str` - use it as a URL parameter.
+            If `None` - use default values for host and port.
+        :param url:
+            Either host or str of `Optional[scheme], host, Optional[port], Optional[prefix]`.
+        :param port:
+            Port of the REST API interface.
+        :param grpc_port:
+            Port of the gRPC interface.
+        :param prefer_grpc:
+            If `True` - use gRPC interface whenever possible in custom methods.
+        :param https:
+            If `True` - use HTTPS(SSL) protocol.
+        :param api_key:
+            API key for authentication in Qdrant Cloud.
+        :param prefix:
+            If not `None` - add prefix to the REST URL path.
+            Example: service/v1 will result in http://localhost:6333/service/v1/{qdrant-endpoint}
+            for REST API.
+        :param timeout:
+            Timeout for REST and gRPC API requests.
+        :param host:
+            Host name of Qdrant service. If ùrl` and `host` are `None`, set to `localhost`.
+        :param path:
+            Persistence path for QdrantLocal.
+        :param force_disable_check_same_thread:
+            For QdrantLocal, force disable check_same_thread.
+            Only use this if you can guarantee that you can resolve the thread safety outside QdrantClient.
+        :param index:
+            Name of the index.
+        :param embedding_dim:
+            Dimension of the embeddings.
+        :param on_disk:
+            Whether to store the collection on disk.
+        :param use_sparse_embedding:
+            If set to `True`, enables support for sparse embeddings.
+        :param sparse_idf:
+            If set to `True`, computes the Inverse Document Frequency (IDF) when using sparse embeddings.
+            It is required to use techniques like BM42. It is ignored if `use_sparse_embeddings` is `False`.
+        :param similarity:
+            The similarity metric to use.
+        :param return_embedding:
+            Whether to return embeddings in the search results.
+        :param progress_bar:
+            Whether to show a progress bar or not.
+        :param recreate_index:
+            Whether to recreate the index.
+        :param shard_number:
+            Number of shards in the collection.
+        :param replication_factor:
+            Replication factor for the collection.
+            Defines how many copies of each shard will be created. Effective only in distributed mode.
+        :param write_consistency_factor:
+            Write consistency factor for the collection. Minimum value is 1.
+            Defines how many replicas should apply to the operation for it to be considered successful.
+            Increasing this number makes the collection more resilient to inconsistencies
+            but will cause failures if not enough replicas are available.
+            Effective only in distributed mode.
+        :param on_disk_payload:
+            If `True`, the point's payload will not be stored in memory and
+            will be read from the disk every time it is requested.
+            This setting saves RAM by slightly increasing response time.
+            Note: indexed payload values remain in RAM.
+        :param hnsw_config:
+            Params for HNSW index.
+        :param optimizers_config:
+            Params for optimizer.
+        :param wal_config:
+            Params for Write-Ahead-Log.
+        :param quantization_config:
+            Params for quantization. If `None`, quantization will be disabled.
+        :param init_from:
+            Use data stored in another collection to initialize this collection.
+        :param wait_result_from_api:
+            Whether to wait for the result from the API after each request.
+        :param metadata:
+            Additional metadata to include with the documents.
+        :param write_batch_size:
+            The batch size for writing documents.
+        :param scroll_size:
+            The scroll size for reading documents.
+        :param payload_fields_to_index:
+            List of payload fields to index.
+        """
 
-        metadata = metadata or {}
-        self.client = qdrant_client.QdrantClient(
-            location=location,
-            url=url,
-            port=port,
-            grpc_port=grpc_port,
-            prefer_grpc=prefer_grpc,
-            https=https,
-            api_key=api_key.resolve_value() if api_key else None,
-            prefix=prefix,
-            timeout=timeout,
-            host=host,
-            path=path,
-            metadata=metadata,
-        )
+        self._client = None
 
         # Store the Qdrant client specific attributes
         self.location = location
@@ -126,7 +232,8 @@ class QdrantDocumentStore:
         self.timeout = timeout
         self.host = host
         self.path = path
-        self.metadata = metadata
+        self.force_disable_check_same_thread = force_disable_check_same_thread
+        self.metadata = metadata or {}
         self.api_key = api_key
 
         # Store the Qdrant collection specific attributes
@@ -143,26 +250,51 @@ class QdrantDocumentStore:
         self.recreate_index = recreate_index
         self.payload_fields_to_index = payload_fields_to_index
         self.use_sparse_embeddings = use_sparse_embeddings
-
-        # Make sure the collection is properly set up
-        self._set_up_collection(
-            index, embedding_dim, recreate_index, similarity, use_sparse_embeddings, on_disk, payload_fields_to_index
-        )
-
+        self.sparse_idf = use_sparse_embeddings and sparse_idf
         self.embedding_dim = embedding_dim
         self.on_disk = on_disk
-        self.content_field = content_field
-        self.name_field = name_field
-        self.embedding_field = embedding_field
         self.similarity = similarity
         self.index = index
         self.return_embedding = return_embedding
         self.progress_bar = progress_bar
-        self.duplicate_documents = duplicate_documents
         self.write_batch_size = write_batch_size
         self.scroll_size = scroll_size
 
+    @property
+    def client(self):
+        if not self._client:
+            self._client = qdrant_client.QdrantClient(
+                location=self.location,
+                url=self.url,
+                port=self.port,
+                grpc_port=self.grpc_port,
+                prefer_grpc=self.prefer_grpc,
+                https=self.https,
+                api_key=self.api_key.resolve_value() if self.api_key else None,
+                prefix=self.prefix,
+                timeout=self.timeout,
+                host=self.host,
+                path=self.path,
+                metadata=self.metadata,
+                force_disable_check_same_thread=self.force_disable_check_same_thread,
+            )
+            # Make sure the collection is properly set up
+            self._set_up_collection(
+                self.index,
+                self.embedding_dim,
+                self.recreate_index,
+                self.similarity,
+                self.use_sparse_embeddings,
+                self.sparse_idf,
+                self.on_disk,
+                self.payload_fields_to_index,
+            )
+        return self._client
+
     def count_documents(self) -> int:
+        """
+        Returns the number of documents present in the Document Store.
+        """
         try:
             response = self.client.count(
                 collection_name=self.index,
@@ -176,13 +308,22 @@ class QdrantDocumentStore:
 
     def filter_documents(
         self,
-        filters: Optional[Dict[str, Any]] = None,
+        filters: Optional[Union[Dict[str, Any], rest.Filter]] = None,
     ) -> List[Document]:
-        if filters and not isinstance(filters, dict):
-            msg = "Filter must be a dictionary"
+        """
+        Returns the documents that match the provided filters.
+
+        For a detailed specification of the filters, refer to the
+        [documentation](https://docs.haystack.deepset.ai/docs/metadata-filtering)
+
+        :param filters: The filters to apply to the document list.
+        :returns: A list of documents that match the given filters.
+        """
+        if filters and not isinstance(filters, dict) and not isinstance(filters, rest.Filter):
+            msg = "Filter must be a dictionary or an instance of `qdrant_client.http.models.Filter`"
             raise ValueError(msg)
 
-        if filters and "operator" not in filters:
+        if filters and not isinstance(filters, rest.Filter) and "operator" not in filters:
             filters = convert_legacy_filters(filters)
         return list(
             self.get_documents_generator(
@@ -195,11 +336,26 @@ class QdrantDocumentStore:
         documents: List[Document],
         policy: DuplicatePolicy = DuplicatePolicy.FAIL,
     ):
+        """
+        Writes documents to Qdrant using the specified policy.
+        The QdrantDocumentStore can handle duplicate documents based on the given policy.
+        The available policies are:
+        - `FAIL`: The operation will raise an error if any document already exists.
+        - `OVERWRITE`: Existing documents will be overwritten with the new ones.
+        - `SKIP`: Existing documents will be skipped, and only new documents will be added.
+
+        :param documents: A list of Document objects to write to Qdrant.
+        :param policy: The policy for handling duplicate documents.
+
+        :returns: The number of documents written to the document store.
+        """
         for doc in documents:
             if not isinstance(doc, Document):
                 msg = f"DocumentStore.write_documents() expects a list of Documents but got an element of {type(doc)}."
                 raise ValueError(msg)
-        self._set_up_collection(self.index, self.embedding_dim, False, self.similarity, self.use_sparse_embeddings)
+        self._set_up_collection(
+            self.index, self.embedding_dim, False, self.similarity, self.use_sparse_embeddings, self.sparse_idf
+        )
 
         if len(documents) == 0:
             logger.warning("Calling QdrantDocumentStore.write_documents() with empty list")
@@ -216,7 +372,6 @@ class QdrantDocumentStore:
             for document_batch in batched_documents:
                 batch = convert_haystack_documents_to_qdrant_points(
                     document_batch,
-                    embedding_field=self.embedding_field,
                     use_sparse_embeddings=self.use_sparse_embeddings,
                 )
 
@@ -230,6 +385,11 @@ class QdrantDocumentStore:
         return len(document_objects)
 
     def delete_documents(self, ids: List[str]):
+        """
+        Deletes documents that match the provided `document_ids` from the document store.
+
+        :param document_ids: the document ids to delete
+        """
         ids = [convert_id(_id) for _id in ids]
         try:
             self.client.delete(
@@ -244,10 +404,24 @@ class QdrantDocumentStore:
 
     @classmethod
     def from_dict(cls, data: Dict[str, Any]) -> "QdrantDocumentStore":
+        """
+        Deserializes the component from a dictionary.
+
+        :param data:
+            The dictionary to deserialize from.
+        :returns:
+            The deserialized component.
+        """
         deserialize_secrets_inplace(data["init_parameters"], keys=["api_key"])
         return default_from_dict(cls, data)
 
     def to_dict(self) -> Dict[str, Any]:
+        """
+        Serializes the component to a dictionary.
+
+        :returns:
+            Dictionary with serialized data.
+        """
         params = inspect.signature(self.__init__).parameters  # type: ignore
         # All the __init__ params must be set as attributes
         # Set as init_parms without default values
@@ -260,8 +434,15 @@ class QdrantDocumentStore:
 
     def get_documents_generator(
         self,
-        filters: Optional[Dict[str, Any]] = None,
+        filters: Optional[Union[Dict[str, Any], rest.Filter]] = None,
     ) -> Generator[Document, None, None]:
+        """
+        Returns a generator that yields documents from Qdrant based on the provided filters.
+
+        :param filters: Filters applied to the retrieved documents.
+        :returns: A generator that yields documents retrieved from Qdrant.
+        """
+
         index = self.index
         qdrant_filters = convert_filters_to_qdrant(filters)
 
@@ -290,6 +471,16 @@ class QdrantDocumentStore:
         ids: List[str],
         index: Optional[str] = None,
     ) -> List[Document]:
+        """
+        Retrieves documents from Qdrant by their IDs.
+
+        :param ids:
+            A list of document IDs to retrieve.
+        :param index:
+            The name of the index to retrieve documents from.
+        :returns:
+            A list of documents.
+        """
         index = index or self.index
 
         documents: List[Document] = []
@@ -311,11 +502,31 @@ class QdrantDocumentStore:
     def _query_by_sparse(
         self,
         query_sparse_embedding: SparseEmbedding,
-        filters: Optional[Dict[str, Any]] = None,
+        filters: Optional[Union[Dict[str, Any], rest.Filter]] = None,
         top_k: int = 10,
-        scale_score: bool = True,
+        scale_score: bool = False,
         return_embedding: bool = False,
+        score_threshold: Optional[float] = None,
     ) -> List[Document]:
+        """
+        Queries Qdrant using a sparse embedding and returns the most relevant documents.
+
+        :param query_sparse_embedding: Sparse embedding of the query.
+        :param filters: Filters applied to the retrieved documents.
+        :param top_k: Maximum number of documents to return.
+        :param scale_score: Whether to scale the scores of the retrieved documents.
+        :param return_embedding: Whether to return the embeddings of the retrieved documents.
+        :param score_threshold: A minimal score threshold for the result.
+            Score of the returned result might be higher or smaller than the threshold
+             depending on the Distance function used.
+            E.g. for cosine similarity only higher scores will be returned.
+
+        :returns: List of documents that are most similar to `query_sparse_embedding`.
+
+        :raises QdrantStoreError:
+            If the Document Store was initialized with `use_sparse_embeddings=False`.
+        """
+
         if not self.use_sparse_embeddings:
             message = (
                 "You are trying to query using sparse embeddings, but the Document Store "
@@ -338,6 +549,7 @@ class QdrantDocumentStore:
             query_filter=qdrant_filters,
             limit=top_k,
             with_vectors=return_embedding,
+            score_threshold=score_threshold,
         )
         results = [
             convert_qdrant_point_to_haystack_document(point, use_sparse_embeddings=self.use_sparse_embeddings)
@@ -353,11 +565,27 @@ class QdrantDocumentStore:
     def _query_by_embedding(
         self,
         query_embedding: List[float],
-        filters: Optional[Dict[str, Any]] = None,
+        filters: Optional[Union[Dict[str, Any], rest.Filter]] = None,
         top_k: int = 10,
-        scale_score: bool = True,
+        scale_score: bool = False,
         return_embedding: bool = False,
+        score_threshold: Optional[float] = None,
     ) -> List[Document]:
+        """
+        Queries Qdrant using a dense embedding and returns the most relevant documents.
+
+        :param query_embedding: Dense embedding of the query.
+        :param filters: Filters applied to the retrieved documents.
+        :param top_k: Maximum number of documents to return.
+        :param scale_score: Whether to scale the scores of the retrieved documents.
+        :param return_embedding: Whether to return the embeddings of the retrieved documents.
+        :param score_threshold: A minimal score threshold for the result.
+            Score of the returned result might be higher or smaller than the threshold
+             depending on the Distance function used.
+            E.g. for cosine similarity only higher scores will be returned.
+
+        :returns: List of documents that are most similar to `query_embedding`.
+        """
         qdrant_filters = convert_filters_to_qdrant(filters)
 
         points = self.client.search(
@@ -369,6 +597,7 @@ class QdrantDocumentStore:
             query_filter=qdrant_filters,
             limit=top_k,
             with_vectors=return_embedding,
+            score_threshold=score_threshold,
         )
         results = [
             convert_qdrant_point_to_haystack_document(point, use_sparse_embeddings=self.use_sparse_embeddings)
@@ -388,9 +617,10 @@ class QdrantDocumentStore:
         self,
         query_embedding: List[float],
         query_sparse_embedding: SparseEmbedding,
-        filters: Optional[Dict[str, Any]] = None,
+        filters: Optional[Union[Dict[str, Any], rest.Filter]] = None,
         top_k: int = 10,
         return_embedding: bool = False,
+        score_threshold: Optional[float] = None,
     ) -> List[Document]:
         """
         Retrieves documents based on dense and sparse embeddings and fuses the results using Reciprocal Rank Fusion.
@@ -400,9 +630,13 @@ class QdrantDocumentStore:
 
         :param query_embedding: Dense embedding of the query.
         :param query_sparse_embedding: Sparse embedding of the query.
-        :param filters: Filters applied to the retrieved Documents.
-        :param top_k: Maximum number of Documents to return.
+        :param filters: Filters applied to the retrieved documents.
+        :param top_k: Maximum number of documents to return.
         :param return_embedding: Whether to return the embeddings of the retrieved documents.
+        :param score_threshold: A minimal score threshold for the result.
+            Score of the returned result might be higher or smaller than the threshold
+             depending on the Distance function used.
+            E.g. for cosine similarity only higher scores will be returned.
 
         :returns: List of Document that are most similar to `query_embedding` and `query_sparse_embedding`.
 
@@ -433,6 +667,7 @@ class QdrantDocumentStore:
             limit=top_k,
             with_payload=True,
             with_vector=return_embedding,
+            score_threshold=score_threshold,
         )
 
         dense_request = rest.SearchRequest(
@@ -464,7 +699,17 @@ class QdrantDocumentStore:
 
         return results
 
-    def _get_distance(self, similarity: str) -> rest.Distance:
+    def get_distance(self, similarity: str) -> rest.Distance:
+        """
+        Retrieves the distance metric for the specified similarity measure.
+
+        :param similarity:
+            The similarity measure to retrieve the distance.
+        :returns:
+            The corresponding rest.Distance object.
+        :raises QdrantStoreError:
+            If the provided similarity measure is not supported.
+        """
         try:
             return self.SIMILARITY[similarity]
         except KeyError as ke:
@@ -495,34 +740,48 @@ class QdrantDocumentStore:
         recreate_collection: bool,
         similarity: str,
         use_sparse_embeddings: bool,
+        sparse_idf: bool,
         on_disk: bool = False,
         payload_fields_to_index: Optional[List[dict]] = None,
     ):
-        distance = self._get_distance(similarity)
+        """
+        Sets up the Qdrant collection with the specified parameters.
+        :param collection_name:
+            The name of the collection to set up.
+        :param embedding_dim:
+            The dimension of the embeddings.
+        :param recreate_collection:
+            Whether to recreate the collection if it already exists.
+        :param similarity:
+            The similarity measure to use.
+        :param use_sparse_embeddings:
+            Whether to use sparse embeddings.
+        :param sparse_idf:
+            Whether to compute the Inverse Document Frequency (IDF) when using sparse embeddings. Required for BM42.
+        :param on_disk:
+            Whether to store the collection on disk.
+        :param payload_fields_to_index:
+            List of payload fields to index.
 
-        if recreate_collection:
+        :raises QdrantStoreError:
+            If the collection exists with incompatible settings.
+        :raises ValueError:
+            If the collection exists with a different similarity measure or embedding dimension.
+
+        """
+        distance = self.get_distance(similarity)
+
+        if recreate_collection or not self.client.collection_exists(collection_name):
             # There is no need to verify the current configuration of that
-            # collection. It might be just recreated again.
-            self._recreate_collection(collection_name, distance, embedding_dim, on_disk, use_sparse_embeddings)
+            # collection. It might be just recreated again or does not exist yet.
+            self.recreate_collection(
+                collection_name, distance, embedding_dim, on_disk, use_sparse_embeddings, sparse_idf
+            )
             # Create Payload index if payload_fields_to_index is provided
             self._create_payload_index(collection_name, payload_fields_to_index)
             return
 
-        try:
-            # Check if the collection already exists and validate its
-            # current configuration with the parameters.
-            collection_info = self.client.get_collection(collection_name)
-        except (UnexpectedResponse, RpcError, ValueError):
-            # That indicates the collection does not exist, so it can be
-            # safely created with any configuration.
-            #
-            # Qdrant local raises ValueError if the collection is not found, but
-            # with the remote server UnexpectedResponse / RpcError is raised.
-            # Until that's unified, we need to catch both.
-            self._recreate_collection(collection_name, distance, embedding_dim, on_disk, use_sparse_embeddings)
-            # Create Payload index if payload_fields_to_index is provided
-            self._create_payload_index(collection_name, payload_fields_to_index)
-            return
+        collection_info = self.client.get_collection(collection_name)
 
         has_named_vectors = (
             isinstance(collection_info.config.params.vectors, dict)
@@ -573,14 +832,37 @@ class QdrantDocumentStore:
             )
             raise ValueError(msg)
 
-    def _recreate_collection(
+    def recreate_collection(
         self,
         collection_name: str,
         distance,
         embedding_dim: int,
-        on_disk: bool,
-        use_sparse_embeddings: bool,
+        on_disk: Optional[bool] = None,
+        use_sparse_embeddings: Optional[bool] = None,
+        sparse_idf: bool = False,
     ):
+        """
+        Recreates the Qdrant collection with the specified parameters.
+
+        :param collection_name:
+            The name of the collection to recreate.
+        :param distance:
+            The distance metric to use for the collection.
+        :param embedding_dim:
+            The dimension of the embeddings.
+        :param on_disk:
+            Whether to store the collection on disk.
+        :param use_sparse_embeddings:
+            Whether to use sparse embeddings.
+        :param sparse_idf:
+            Whether to compute the Inverse Document Frequency (IDF) when using sparse embeddings. Required for BM42.
+        """
+        if on_disk is None:
+            on_disk = self.on_disk
+
+        if use_sparse_embeddings is None:
+            use_sparse_embeddings = self.use_sparse_embeddings
+
         # dense vectors configuration
         vectors_config = rest.VectorParams(size=embedding_dim, on_disk=on_disk, distance=distance)
 
@@ -592,11 +874,15 @@ class QdrantDocumentStore:
                 SPARSE_VECTORS_NAME: rest.SparseVectorParams(
                     index=rest.SparseIndexParams(
                         on_disk=on_disk,
-                    )
+                    ),
+                    modifier=rest.Modifier.IDF if sparse_idf else None,
                 ),
             }
 
-        self.client.recreate_collection(
+        if self.client.collection_exists(collection_name):
+            self.client.delete_collection(collection_name)
+
+        self.client.create_collection(
             collection_name=collection_name,
             vectors_config=vectors_config,
             sparse_vectors_config=sparse_vectors_config if use_sparse_embeddings else None,
@@ -623,12 +909,7 @@ class QdrantDocumentStore:
 
         :param documents: A list of Haystack Document objects.
         :param index: name of the index
-        :param duplicate_documents: Handle duplicates document based on parameter options.
-                                    Parameter options : ( 'skip','overwrite','fail')
-                                    skip (default option): Ignore the duplicates documents
-                                    overwrite: Update any existing documents with the same ID when adding documents.
-                                    fail: an error is raised if the document ID of the document being added already
-                                    exists.
+        :param policy: The duplicate policy to use when writing documents.
         :returns: A list of Haystack Document objects.
         """
 
@@ -648,10 +929,10 @@ class QdrantDocumentStore:
 
     def _drop_duplicate_documents(self, documents: List[Document], index: Optional[str] = None) -> List[Document]:
         """
-        Drop duplicates documents based on same hash ID
+        Drop duplicate documents based on same hash ID.
 
         :param documents: A list of Haystack Document objects.
-        :param index: name of the index
+        :param index: Name of the index.
         :returns: A list of Haystack Document objects.
         """
         _hash_ids: Set = set()

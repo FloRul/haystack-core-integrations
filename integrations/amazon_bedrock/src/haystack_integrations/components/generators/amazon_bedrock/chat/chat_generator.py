@@ -23,10 +23,12 @@ logger = logging.getLogger(__name__)
 @component
 class AmazonBedrockChatGenerator:
     """
-    `AmazonBedrockChatGenerator` enables text generation via Amazon Bedrock hosted chat LLMs.
+    Completes chats using LLMs hosted on Amazon Bedrock.
 
-    For example, to use the Anthropic Claude 3 Sonnet model, simply initialize the `AmazonBedrockChatGenerator` with the
+    For example, to use the Anthropic Claude 3 Sonnet model, initialize this component with the
     'anthropic.claude-3-sonnet-20240229-v1:0' model name.
+
+    ### Usage example
 
     ```python
     from haystack_integrations.components.generators.amazon_bedrock import AmazonBedrockChatGenerator
@@ -43,8 +45,16 @@ class AmazonBedrockChatGenerator:
 
     ```
 
-    If you prefer non-streaming mode, simply remove the `streaming_callback` parameter, capture the return value of the
-    component's run method and the `AmazonBedrockChatGenerator` will return the response in a non-streaming mode.
+    AmazonBedrockChatGenerator uses AWS for authentication. You can use the AWS CLI to authenticate through your IAM.
+    For more information on setting up an IAM identity-based policy, see [Amazon Bedrock documentation]
+    (https://docs.aws.amazon.com/bedrock/latest/userguide/security_iam_id-based-policy-examples.html).
+
+    If the AWS environment is configured correctly, the AWS credentials are not required as they're loaded
+    automatically from the environment or the AWS configuration file.
+    If the AWS environment is not configured, set `aws_access_key_id`, `aws_secret_access_key`,
+      and `aws_region_name` as environment variables or pass them as
+     [Secret](https://docs.haystack.deepset.ai/v2.0/docs/secret-management) arguments. Make sure the region you set
+    supports Amazon Bedrock.
     """
 
     SUPPORTED_MODEL_PATTERNS: ClassVar[Dict[str, Type[BedrockModelChatAdapter]]] = {
@@ -66,6 +76,7 @@ class AmazonBedrockChatGenerator:
         generation_kwargs: Optional[Dict[str, Any]] = None,
         stop_words: Optional[List[str]] = None,
         streaming_callback: Optional[Callable[[StreamingChunk], None]] = None,
+        truncate: Optional[bool] = True,
     ):
         """
         Initializes the `AmazonBedrockChatGenerator` with the provided parameters. The parameters are passed to the
@@ -77,23 +88,28 @@ class AmazonBedrockChatGenerator:
         constructor. Aside from model, three required parameters are `aws_access_key_id`, `aws_secret_access_key`,
         and `aws_region_name`.
 
-        :param model: The model to use for generation. The model must be available in Amazon Bedrock. The model has to
-        be specified in the format outlined in the Amazon Bedrock [documentation](https://docs.aws.amazon.com/bedrock/latest/userguide/model-ids-arns.html).
+        :param model: The model to use for text generation. The model must be available in Amazon Bedrock and must
+        be specified in the format outlined in the [Amazon Bedrock documentation](https://docs.aws.amazon.com/bedrock/latest/userguide/model-ids-arns.html).
         :param aws_access_key_id: AWS access key ID.
         :param aws_secret_access_key: AWS secret access key.
         :param aws_session_token: AWS session token.
-        :param aws_region_name: AWS region name.
+        :param aws_region_name: AWS region name. Make sure the region you set supports Amazon Bedrock.
         :param aws_profile_name: AWS profile name.
-        :param generation_kwargs: Additional generation keyword arguments passed to the model. The defined keyword
-        parameters are specific to a specific model and can be found in the model's documentation. For example, the
-        Anthropic Claude generation parameters can be found [here](https://docs.anthropic.com/claude/reference/complete_post).
-        :param stop_words: A list of stop words that stop model generation when encountered. They can be provided via
-        this parameter or via models generation_kwargs under a model's specific key for stop words. For example, the
-        Anthropic Claude stop words are provided via the `stop_sequences` key.
-        :param streaming_callback: A callback function that is called when a new chunk is received from the stream.
-        By default, the model is not set up for streaming. To enable streaming simply set this parameter to a callback
-        function that will handle the streaming chunks. The callback function will receive a StreamingChunk object and
-        switch the streaming mode on.
+        :param generation_kwargs: Keyword arguments sent to the model. These
+        parameters are specific to a model. You can find them in the model's documentation.
+          For example, you can find the
+        Anthropic Claude generation parameters in [Anthropic documentation](https://docs.anthropic.com/claude/reference/complete_post).
+        :param stop_words: A list of stop words that stop the model from generating more text
+          when encountered. You can provide them using
+        this parameter or using the model's `generation_kwargs` under a model's specific key for stop words.
+          For example, you can provide
+        stop words for Anthropic Claude in the `stop_sequences` key.
+        :param streaming_callback: A callback function called when a new token is received from the stream.
+        By default, the model is not set up for streaming. To enable streaming, set this parameter to a callback
+        function that handles the streaming chunks. The callback function receives a
+          [StreamingChunk](https://docs.haystack.deepset.ai/docs/data-classes#streamingchunk) object and
+        switches the streaming mode on.
+        :param truncate: Whether to truncate the prompt messages or not.
         """
         if not model:
             msg = "'model' cannot be None or empty string"
@@ -104,13 +120,14 @@ class AmazonBedrockChatGenerator:
         self.aws_session_token = aws_session_token
         self.aws_region_name = aws_region_name
         self.aws_profile_name = aws_profile_name
+        self.truncate = truncate
 
         # get the model adapter for the given model
         model_adapter_cls = self.get_model_adapter(model=model)
         if not model_adapter_cls:
             msg = f"AmazonBedrockGenerator doesn't support the model {model}."
             raise AmazonBedrockConfigurationError(msg)
-        self.model_adapter = model_adapter_cls(generation_kwargs or {})
+        self.model_adapter = model_adapter_cls(self.truncate, generation_kwargs or {})
 
         # create the AWS session and client
         def resolve_secret(secret: Optional[Secret]) -> Optional[str]:
@@ -135,18 +152,29 @@ class AmazonBedrockChatGenerator:
         self.stop_words = stop_words or []
         self.streaming_callback = streaming_callback
 
-    def invoke(self, *args, **kwargs):
+    @component.output_types(replies=List[ChatMessage])
+    def run(
+        self,
+        messages: List[ChatMessage],
+        streaming_callback: Optional[Callable[[StreamingChunk], None]] = None,
+        generation_kwargs: Optional[Dict[str, Any]] = None,
+    ):
         """
-        Invokes the Amazon Bedrock LLM with the given parameters. The parameters are passed to the Amazon Bedrock
-        client.
+        Generates a list of `ChatMessage` response to the given messages using the Amazon Bedrock LLM.
 
-        :param args: The positional arguments passed to the generator.
-        :param kwargs: The keyword arguments passed to the generator.
-        :returns: List of `ChatMessage` generated by LLM.
+        :param messages: The messages to generate a response to.
+        :param streaming_callback:
+            A callback function that is called when a new token is received from the stream.
+        :param generation_kwargs: Additional generation keyword arguments passed to the model.
+        :returns: A dictionary with the following keys:
+            - `replies`: The generated List of `ChatMessage` objects.
         """
+        generation_kwargs = generation_kwargs or {}
+        generation_kwargs = generation_kwargs.copy()
 
-        kwargs = kwargs.copy()
-        messages: List[ChatMessage] = kwargs.pop("messages", [])
+        streaming_callback = streaming_callback or self.streaming_callback
+        generation_kwargs["stream"] = streaming_callback is not None
+
         # check if the prompt is a list of ChatMessage objects
         if not (
             isinstance(messages, list)
@@ -156,39 +184,35 @@ class AmazonBedrockChatGenerator:
             msg = f"The model {self.model} requires a list of ChatMessage objects as a prompt."
             raise ValueError(msg)
 
-        body = self.model_adapter.prepare_body(messages=messages, **{"stop_words": self.stop_words, **kwargs})
+        body = self.model_adapter.prepare_body(
+            messages=messages, **{"stop_words": self.stop_words, **generation_kwargs}
+        )
         try:
-            if self.streaming_callback:
+            if streaming_callback:
                 response = self.client.invoke_model_with_response_stream(
                     body=json.dumps(body), modelId=self.model, accept="application/json", contentType="application/json"
                 )
                 response_stream = response["body"]
-                responses = self.model_adapter.get_stream_responses(
-                    stream=response_stream, stream_handler=self.streaming_callback
+                replies = self.model_adapter.get_stream_responses(
+                    stream=response_stream, streaming_callback=streaming_callback
                 )
             else:
                 response = self.client.invoke_model(
                     body=json.dumps(body), modelId=self.model, accept="application/json", contentType="application/json"
                 )
                 response_body = json.loads(response.get("body").read().decode("utf-8"))
-                responses = self.model_adapter.get_responses(response_body=response_body)
+                replies = self.model_adapter.get_responses(response_body=response_body)
         except ClientError as exception:
             msg = f"Could not inference Amazon Bedrock model {self.model} due: {exception}"
             raise AmazonBedrockInferenceError(msg) from exception
 
-        return responses
+        # rename the meta key to be inline with OpenAI meta output keys
+        for response in replies:
+            if response.meta is not None and "usage" in response.meta:
+                response.meta["usage"]["prompt_tokens"] = response.meta["usage"].pop("input_tokens")
+                response.meta["usage"]["completion_tokens"] = response.meta["usage"].pop("output_tokens")
 
-    @component.output_types(replies=List[ChatMessage])
-    def run(self, messages: List[ChatMessage], generation_kwargs: Optional[Dict[str, Any]] = None):
-        """
-        Generates a list of `ChatMessage` response to the given messages using the Amazon Bedrock LLM.
-
-        :param messages: The messages to generate a response to.
-        :param generation_kwargs: Additional generation keyword arguments passed to the model.
-        :returns: A dictionary with the following keys:
-            - `replies`: The generated List of `ChatMessage` objects.
-        """
-        return {"replies": self.invoke(messages=messages, **(generation_kwargs or {}))}
+        return {"replies": replies}
 
     @classmethod
     def get_model_adapter(cls, model: str) -> Optional[Type[BedrockModelChatAdapter]]:
@@ -222,6 +246,7 @@ class AmazonBedrockChatGenerator:
             stop_words=self.stop_words,
             generation_kwargs=self.model_adapter.generation_kwargs,
             streaming_callback=callback_name,
+            truncate=self.truncate,
         )
 
     @classmethod

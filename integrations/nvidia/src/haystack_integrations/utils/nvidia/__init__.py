@@ -1,3 +1,4 @@
-from .client import NvidiaCloudFunctionsClient
+from .nim_backend import Model, NimBackend
+from .utils import is_hosted, url_validation
 
-__all__ = ["NvidiaCloudFunctionsClient"]
+__all__ = ["NimBackend", "Model", "is_hosted", "url_validation"]

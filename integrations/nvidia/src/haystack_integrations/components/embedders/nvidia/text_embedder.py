@@ -1,19 +1,20 @@
-from typing import Any, Dict, List, Optional
+import warnings
+from typing import Any, Dict, List, Optional, Union
 
 from haystack import component, default_from_dict, default_to_dict
 from haystack.utils import Secret, deserialize_secrets_inplace
+from haystack_integrations.utils.nvidia import NimBackend, is_hosted, url_validation
 
-from ._nim_backend import NimBackend
-from ._nvcf_backend import NvcfBackend
-from .backend import EmbedderBackend
+from .truncate import EmbeddingTruncateMode
+
+_DEFAULT_API_URL = "https://ai.api.nvidia.com/v1/retrieval/nvidia"
 
 
 @component
 class NvidiaTextEmbedder:
     """
     A component for embedding strings using embedding models provided by
-    [NVIDIA AI Foundation Endpoints](https://www.nvidia.com/en-us/ai-data-science/foundation-models/)
-    and NVIDIA Inference Microservices.
+    [NVIDIA NIMs](https://ai.nvidia.com).
 
     For models that differentiate between query and document inputs,
     this component embeds the input string as a query.
@@ -24,7 +25,7 @@ class NvidiaTextEmbedder:
 
     text_to_embed = "I love pizza!"
 
-    text_embedder = NvidiaTextEmbedder(model="nvolveqa_40k")
+    text_embedder = NvidiaTextEmbedder(model="NV-Embed-QA", api_url="https://ai.api.nvidia.com/v1/retrieval/nvidia")
     text_embedder.warm_up()
 
     print(text_embedder.run(text_to_embed))
@@ -33,35 +34,68 @@ class NvidiaTextEmbedder:
 
     def __init__(
         self,
-        model: str,
+        model: Optional[str] = None,
         api_key: Optional[Secret] = Secret.from_env_var("NVIDIA_API_KEY"),
-        api_url: Optional[str] = None,
+        api_url: str = _DEFAULT_API_URL,
         prefix: str = "",
         suffix: str = "",
+        truncate: Optional[Union[EmbeddingTruncateMode, str]] = None,
     ):
         """
         Create a NvidiaTextEmbedder component.
 
         :param model:
             Embedding model to use.
+            If no specific model along with locally hosted API URL is provided,
+            the system defaults to the available model found using /models API.
         :param api_key:
-            API key for the NVIDIA AI Foundation Endpoints.
+            API key for the NVIDIA NIM.
         :param api_url:
-            Custom API URL for the NVIDIA Inference Microservices.
+            Custom API URL for the NVIDIA NIM.
+            Format for API URL is http://host:port
         :param prefix:
             A string to add to the beginning of each text.
         :param suffix:
             A string to add to the end of each text.
+        :param truncate:
+            Specifies how inputs longer that the maximum token length should be truncated.
+            If None the behavior is model-dependent, see the official documentation for more information.
         """
 
         self.api_key = api_key
         self.model = model
-        self.api_url = api_url
+        self.api_url = url_validation(api_url, _DEFAULT_API_URL, ["v1/embeddings"])
         self.prefix = prefix
         self.suffix = suffix
 
-        self.backend: Optional[EmbedderBackend] = None
+        if isinstance(truncate, str):
+            truncate = EmbeddingTruncateMode.from_str(truncate)
+        self.truncate = truncate
+
+        self.backend: Optional[Any] = None
         self._initialized = False
+
+        if is_hosted(api_url) and not self.model:  # manually set default model
+            self.model = "NV-Embed-QA"
+
+    def default_model(self):
+        """Set default model in local NIM mode."""
+        valid_models = [
+            model.id for model in self.backend.models() if not model.base_model or model.base_model == model.id
+        ]
+        name = next(iter(valid_models), None)
+        if name:
+            warnings.warn(
+                f"Default model is set as: {name}. \n"
+                "Set model using model parameter. \n"
+                "To get available models use available_models property.",
+                UserWarning,
+                stacklevel=2,
+            )
+            self.model = self.backend.model = name
+        else:
+            error_message = "No locally hosted model was found."
+            raise ValueError(error_message)
 
     def warm_up(self):
         """
@@ -70,16 +104,20 @@ class NvidiaTextEmbedder:
         if self._initialized:
             return
 
-        if self.api_url is None:
-            if self.api_key is None:
-                msg = "API key is required for NVIDIA AI Foundation Endpoints."
-                raise ValueError(msg)
-
-            self.backend = NvcfBackend(self.model, api_key=self.api_key, model_kwargs={"model": "query"})
-        else:
-            self.backend = NimBackend(self.model, api_url=self.api_url, model_kwargs={"input_type": "query"})
+        model_kwargs = {"input_type": "query"}
+        if self.truncate is not None:
+            model_kwargs["truncate"] = str(self.truncate)
+        self.backend = NimBackend(
+            self.model,
+            api_url=self.api_url,
+            api_key=self.api_key,
+            model_kwargs=model_kwargs,
+        )
 
         self._initialized = True
+
+        if not self.model:
+            self.default_model()
 
     def to_dict(self) -> Dict[str, Any]:
         """
@@ -95,6 +133,7 @@ class NvidiaTextEmbedder:
             api_url=self.api_url,
             prefix=self.prefix,
             suffix=self.suffix,
+            truncate=str(self.truncate) if self.truncate is not None else None,
         )
 
     @classmethod

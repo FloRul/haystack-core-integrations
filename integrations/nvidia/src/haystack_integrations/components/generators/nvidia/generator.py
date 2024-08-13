@@ -1,29 +1,29 @@
 # SPDX-FileCopyrightText: 2024-present deepset GmbH <info@deepset.ai>
 #
 # SPDX-License-Identifier: Apache-2.0
+import warnings
 from typing import Any, Dict, List, Optional
 
 from haystack import component, default_from_dict, default_to_dict
 from haystack.utils.auth import Secret, deserialize_secrets_inplace
+from haystack_integrations.utils.nvidia import NimBackend, is_hosted, url_validation
 
-from ._nim_backend import NimBackend
-from ._nvcf_backend import NvcfBackend
-from .backend import GeneratorBackend
+_DEFAULT_API_URL = "https://integrate.api.nvidia.com/v1"
 
 
 @component
 class NvidiaGenerator:
     """
-    A component for generating text using generative models provided by
-    [NVIDIA AI Foundation Endpoints](https://www.nvidia.com/en-us/ai-data-science/foundation-models/)
-    and NVIDIA Inference Microservices.
+    Generates text using generative models hosted with
+    [NVIDIA NIM](https://ai.nvidia.com) on on the [NVIDIA API Catalog](https://build.nvidia.com/explore/discover).
 
-    Usage example:
+    ### Usage example
+
     ```python
     from haystack_integrations.components.generators.nvidia import NvidiaGenerator
 
     generator = NvidiaGenerator(
-        model="nv_llama2_rlhf_70b",
+        model="meta/llama3-70b-instruct",
         model_arguments={
             "temperature": 0.2,
             "top_p": 0.7,
@@ -37,12 +37,14 @@ class NvidiaGenerator:
     print(result["meta"])
     print(result["usage"])
     ```
+
+    You need an NVIDIA API key for this component to work.
     """
 
     def __init__(
         self,
-        model: str,
-        api_url: Optional[str] = None,
+        model: Optional[str] = None,
+        api_url: str = _DEFAULT_API_URL,
         api_key: Optional[Secret] = Secret.from_env_var("NVIDIA_API_KEY"),
         model_arguments: Optional[Dict[str, Any]] = None,
     ):
@@ -51,23 +53,49 @@ class NvidiaGenerator:
 
         :param model:
             Name of the model to use for text generation.
-            See the [Nvidia catalog](https://catalog.ngc.nvidia.com/ai-foundation-models)
+            See the [NVIDIA NIMs](https://ai.nvidia.com)
             for more information on the supported models.
+            `Note`: If no specific model along with locally hosted API URL is provided,
+            the system defaults to the available model found using /models API.
+            Check supported models at [NVIDIA NIM](https://ai.nvidia.com).
         :param api_key:
-            API key for the NVIDIA AI Foundation Endpoints.
+            API key for the NVIDIA NIM. Set it as the `NVIDIA_API_KEY` environment
+            variable or pass it here.
         :param api_url:
-            Custom API URL for the NVIDIA Inference Microservices.
+            Custom API URL for the NVIDIA NIM.
         :param model_arguments:
-            Additional arguments to pass to the model provider. Different models accept different arguments.
-            Search your model in the [Nvidia catalog](https://catalog.ngc.nvidia.com/ai-foundation-models)
-            to know the supported arguments.
+            Additional arguments to pass to the model provider. These arguments are
+            specific to a model.
+            Search your model in the [NVIDIA NIM](https://ai.nvidia.com)
+            to find the arguments it accepts.
         """
         self._model = model
-        self._api_url = api_url
+        self._api_url = url_validation(api_url, _DEFAULT_API_URL, ["v1/chat/completions"])
         self._api_key = api_key
         self._model_arguments = model_arguments or {}
 
-        self._backend: Optional[GeneratorBackend] = None
+        self._backend: Optional[Any] = None
+
+        self.is_hosted = is_hosted(api_url)
+
+    def default_model(self):
+        """Set default model in local NIM mode."""
+        valid_models = [
+            model.id for model in self._backend.models() if not model.base_model or model.base_model == model.id
+        ]
+        name = next(iter(valid_models), None)
+        if name:
+            warnings.warn(
+                f"Default model is set as: {name}. \n"
+                "Set model using model parameter. \n"
+                "To get available models use available_models property.",
+                UserWarning,
+                stacklevel=2,
+            )
+            self._model = self._backend.model_name = name
+        else:
+            error_message = "No locally hosted model was found."
+            raise ValueError(error_message)
 
     def warm_up(self):
         """
@@ -76,17 +104,18 @@ class NvidiaGenerator:
         if self._backend is not None:
             return
 
-        if self._api_url is None:
-            if self._api_key is None:
-                msg = "API key is required for NVIDIA AI Foundation Endpoints."
-                raise ValueError(msg)
-            self._backend = NvcfBackend(self._model, api_key=self._api_key, model_kwargs=self._model_arguments)
-        else:
-            self._backend = NimBackend(
-                self._model,
-                api_url=self._api_url,
-                model_kwargs=self._model_arguments,
-            )
+        if self._api_url == _DEFAULT_API_URL and self._api_key is None:
+            msg = "API key is required for hosted NVIDIA NIMs."
+            raise ValueError(msg)
+        self._backend = NimBackend(
+            self._model,
+            api_url=self._api_url,
+            api_key=self._api_key,
+            model_kwargs=self._model_arguments,
+        )
+
+        if not self.is_hosted and not self._model:
+            self.default_model()
 
     def to_dict(self) -> Dict[str, Any]:
         """

@@ -4,11 +4,13 @@
 
 from unittest.mock import patch
 
+import numpy as np
 import pytest
 from haystack.dataclasses.document import ByteStream, Document
 from haystack.document_stores.errors import DuplicateDocumentError
 from haystack.document_stores.types import DuplicatePolicy
 from haystack.testing.document_store import CountDocumentsTest, DeleteDocumentsTest, WriteDocumentsTest
+from haystack.utils import Secret
 from haystack_integrations.document_stores.pgvector import PgvectorDocumentStore
 from pandas import DataFrame
 
@@ -51,7 +53,9 @@ def test_init(monkeypatch):
         search_strategy="hnsw",
         hnsw_recreate_index_if_exists=True,
         hnsw_index_creation_kwargs={"m": 32, "ef_construction": 128},
+        hnsw_index_name="my_hnsw_index",
         hnsw_ef_search=50,
+        keyword_index_name="my_keyword_index",
     )
 
     assert document_store.table_name == "my_table"
@@ -61,7 +65,9 @@ def test_init(monkeypatch):
     assert document_store.search_strategy == "hnsw"
     assert document_store.hnsw_recreate_index_if_exists
     assert document_store.hnsw_index_creation_kwargs == {"m": 32, "ef_construction": 128}
+    assert document_store.hnsw_index_name == "my_hnsw_index"
     assert document_store.hnsw_ef_search == 50
+    assert document_store.keyword_index_name == "my_keyword_index"
 
 
 @pytest.mark.usefixtures("patches_for_unit_tests")
@@ -76,7 +82,9 @@ def test_to_dict(monkeypatch):
         search_strategy="hnsw",
         hnsw_recreate_index_if_exists=True,
         hnsw_index_creation_kwargs={"m": 32, "ef_construction": 128},
+        hnsw_index_name="my_hnsw_index",
         hnsw_ef_search=50,
+        keyword_index_name="my_keyword_index",
     )
 
     assert document_store.to_dict() == {
@@ -89,8 +97,11 @@ def test_to_dict(monkeypatch):
             "recreate_table": True,
             "search_strategy": "hnsw",
             "hnsw_recreate_index_if_exists": True,
+            "language": "english",
             "hnsw_index_creation_kwargs": {"m": 32, "ef_construction": 128},
+            "hnsw_index_name": "my_hnsw_index",
             "hnsw_ef_search": 50,
+            "keyword_index_name": "my_keyword_index",
         },
     }
 
@@ -169,7 +180,7 @@ def test_from_pg_to_haystack_documents():
             "blob_meta": None,
             "blob_mime_type": None,
             "meta": {"meta_key": "meta_value"},
-            "embedding": "[0.1, 0.2, 0.3]",
+            "embedding": np.array([0.1, 0.2, 0.3]),
         },
         {
             "id": "2",
@@ -179,7 +190,7 @@ def test_from_pg_to_haystack_documents():
             "blob_meta": None,
             "blob_mime_type": None,
             "meta": {"meta_key": "meta_value"},
-            "embedding": "[0.4, 0.5, 0.6]",
+            "embedding": np.array([0.4, 0.5, 0.6]),
         },
         {
             "id": "3",
@@ -189,16 +200,11 @@ def test_from_pg_to_haystack_documents():
             "blob_meta": {"blob_meta_key": "blob_meta_value"},
             "blob_mime_type": "mime_type",
             "meta": {"meta_key": "meta_value"},
-            "embedding": "[0.7, 0.8, 0.9]",
+            "embedding": np.array([0.7, 0.8, 0.9]),
         },
     ]
 
-    with patch(
-        "haystack_integrations.document_stores.pgvector.document_store.PgvectorDocumentStore.__init__"
-    ) as mock_init:
-        mock_init.return_value = None
-        ds = PgvectorDocumentStore(connection_string="test")
-
+    ds = PgvectorDocumentStore(connection_string=Secret.from_token("test"))
     haystack_docs = ds._from_pg_to_haystack_documents(pg_docs)
 
     assert haystack_docs[0].id == "1"

@@ -2,6 +2,7 @@ from typing import Optional, Type
 from unittest.mock import MagicMock, call, patch
 
 import pytest
+from haystack.dataclasses import StreamingChunk
 
 from haystack_integrations.components.generators.amazon_bedrock import AmazonBedrockGenerator
 from haystack_integrations.components.generators.amazon_bedrock.adapters import (
@@ -10,7 +11,8 @@ from haystack_integrations.components.generators.amazon_bedrock.adapters import 
     AnthropicClaudeAdapter,
     BedrockModelAdapter,
     CohereCommandAdapter,
-    MetaLlama2ChatAdapter,
+    CohereCommandRAdapter,
+    MetaLlamaAdapter,
     MistralAdapter,
 )
 
@@ -19,10 +21,7 @@ def test_to_dict(mock_boto3_session):
     """
     Test that the to_dict method returns the correct dictionary without aws credentials
     """
-    generator = AmazonBedrockGenerator(
-        model="anthropic.claude-v2",
-        max_length=99,
-    )
+    generator = AmazonBedrockGenerator(model="anthropic.claude-v2", max_length=99, truncate=False, temperature=10)
 
     expected_dict = {
         "type": "haystack_integrations.components.generators.amazon_bedrock.generator.AmazonBedrockGenerator",
@@ -34,6 +33,9 @@ def test_to_dict(mock_boto3_session):
             "aws_profile_name": {"type": "env_var", "env_vars": ["AWS_PROFILE"], "strict": False},
             "model": "anthropic.claude-v2",
             "max_length": 99,
+            "truncate": False,
+            "temperature": 10,
+            "streaming_callback": None,
         },
     }
 
@@ -120,15 +122,6 @@ def test_constructor_with_empty_model():
         AmazonBedrockGenerator(model="")
 
 
-def test_invoke_with_no_kwargs(mock_boto3_session):
-    """
-    Test invoke raises an error if no prompt is provided
-    """
-    layer = AmazonBedrockGenerator(model="anthropic.claude-v2")
-    with pytest.raises(ValueError, match="The model anthropic.claude-v2 requires a valid prompt."):
-        layer.invoke()
-
-
 def test_short_prompt_is_not_truncated(mock_boto3_session):
     """
     Test that a short prompt is not truncated
@@ -193,6 +186,46 @@ def test_long_prompt_is_truncated(mock_boto3_session):
     assert prompt_after_resize == truncated_prompt_text
 
 
+def test_long_prompt_is_not_truncated_when_truncate_false(mock_boto3_session):
+    """
+    Test that a long prompt is not truncated and _ensure_token_limit is not called when truncate is set to False
+    """
+    long_prompt_text = "I am a tokenized prompt of length eight"
+
+    # Our mock prompt is 8 tokens long, so it exceeds the total limit (8 prompt tokens + 3 generated tokens > 10 tokens)
+    max_length_generated_text = 3
+    total_model_max_length = 10
+
+    with patch("transformers.AutoTokenizer.from_pretrained", return_value=MagicMock()):
+        generator = AmazonBedrockGenerator(
+            model="anthropic.claude-v2",
+            max_length=max_length_generated_text,
+            model_max_length=total_model_max_length,
+            truncate=False,
+        )
+
+        # Mock the _ensure_token_limit method to track if it is called
+        with patch.object(
+            generator, "_ensure_token_limit", wraps=generator._ensure_token_limit
+        ) as mock_ensure_token_limit:
+            # Mock the model adapter to avoid actual invocation
+            generator.model_adapter.prepare_body = MagicMock(return_value={})
+            generator.client = MagicMock()
+            generator.client.invoke_model = MagicMock(
+                return_value={"body": MagicMock(read=MagicMock(return_value=b'{"generated_text": "response"}'))}
+            )
+            generator.model_adapter.get_responses = MagicMock(return_value=["response"])
+
+            # Invoke the generator
+            generator.run(prompt=long_prompt_text)
+
+        # Ensure _ensure_token_limit was not called
+        mock_ensure_token_limit.assert_not_called(),
+
+        # Check the prompt passed to prepare_body
+        generator.model_adapter.prepare_body.assert_called_with(prompt=long_prompt_text, stream=False)
+
+
 @pytest.mark.parametrize(
     "model, expected_model_adapter",
     [
@@ -203,6 +236,9 @@ def test_long_prompt_is_truncated(mock_boto3_session):
         ("cohere.command-text-v14", CohereCommandAdapter),
         ("cohere.command-light-text-v14", CohereCommandAdapter),
         ("cohere.command-text-v21", CohereCommandAdapter),  # artificial
+        ("cohere.command-r-v1:0", CohereCommandRAdapter),
+        ("cohere.command-r-plus-v1:0", CohereCommandRAdapter),
+        ("cohere.command-r-v8:9", CohereCommandRAdapter),  # artificial
         ("ai21.j2-mid-v1", AI21LabsJurassic2Adapter),
         ("ai21.j2-ultra-v1", AI21LabsJurassic2Adapter),
         ("ai21.j2-mega-v5", AI21LabsJurassic2Adapter),  # artificial
@@ -210,9 +246,16 @@ def test_long_prompt_is_truncated(mock_boto3_session):
         ("amazon.titan-text-express-v1", AmazonTitanAdapter),
         ("amazon.titan-text-agile-v1", AmazonTitanAdapter),
         ("amazon.titan-text-lightning-v8", AmazonTitanAdapter),  # artificial
-        ("meta.llama2-13b-chat-v1", MetaLlama2ChatAdapter),
-        ("meta.llama2-70b-chat-v1", MetaLlama2ChatAdapter),
-        ("meta.llama2-130b-v5", MetaLlama2ChatAdapter),  # artificial
+        ("meta.llama2-13b-chat-v1", MetaLlamaAdapter),
+        ("meta.llama2-70b-chat-v1", MetaLlamaAdapter),
+        ("meta.llama2-130b-v5", MetaLlamaAdapter),  # artificial
+        ("meta.llama3-8b-instruct-v1:0", MetaLlamaAdapter),
+        ("meta.llama3-70b-instruct-v1:0", MetaLlamaAdapter),
+        ("meta.llama3-130b-instruct-v5:9", MetaLlamaAdapter),  # artificial
+        ("mistral.mistral-7b-instruct-v0:2", MistralAdapter),
+        ("mistral.mixtral-8x7b-instruct-v0:1", MistralAdapter),
+        ("mistral.mistral-large-2402-v1:0", MistralAdapter),
+        ("mistral.mistral-medium-v8:0", MistralAdapter),  # artificial
         ("unknown_model", None),
     ],
 )
@@ -225,8 +268,178 @@ def test_get_model_adapter(model: str, expected_model_adapter: Optional[Type[Bed
 
 
 class TestAnthropicClaudeAdapter:
+    def test_default_init(self) -> None:
+        adapter = AnthropicClaudeAdapter(model_kwargs={}, max_length=100)
+        assert adapter.use_messages_api is True
+
+    def test_use_messages_api_false(self) -> None:
+        adapter = AnthropicClaudeAdapter(model_kwargs={"use_messages_api": False}, max_length=100)
+        assert adapter.use_messages_api is False
+
+
+class TestAnthropicClaudeAdapterMessagesAPI:
     def test_prepare_body_with_default_params(self) -> None:
         layer = AnthropicClaudeAdapter(model_kwargs={}, max_length=99)
+        prompt = "Hello, how are you?"
+        expected_body = {
+            "messages": [{"role": "user", "content": "Hello, how are you?"}],
+            "max_tokens": 99,
+            "anthropic_version": "bedrock-2023-05-31",
+        }
+
+        body = layer.prepare_body(prompt)
+
+        assert body == expected_body
+
+    def test_prepare_body_with_custom_inference_params(self) -> None:
+        layer = AnthropicClaudeAdapter(model_kwargs={}, max_length=99)
+        prompt = "Hello, how are you?"
+        expected_body = {
+            "messages": [{"role": "user", "content": "Hello, how are you?"}],
+            "max_tokens": 50,
+            "stop_sequences": ["CUSTOM_STOP"],
+            "temperature": 0.7,
+            "top_p": 0.8,
+            "top_k": 5,
+            "system": "system prompt",
+            "anthropic_version": "custom_version",
+        }
+
+        body = layer.prepare_body(
+            prompt,
+            temperature=0.7,
+            top_p=0.8,
+            top_k=5,
+            max_tokens=50,
+            stop_sequences=["CUSTOM_STOP"],
+            system="system prompt",
+            anthropic_version="custom_version",
+            unknown_arg="unknown_value",
+        )
+
+        assert body == expected_body
+
+    def test_prepare_body_with_model_kwargs(self) -> None:
+        layer = AnthropicClaudeAdapter(
+            model_kwargs={
+                "temperature": 0.7,
+                "top_p": 0.8,
+                "top_k": 5,
+                "max_tokens": 50,
+                "stop_sequences": ["CUSTOM_STOP"],
+                "system": "system prompt",
+                "anthropic_version": "custom_version",
+                "unknown_arg": "unknown_value",
+            },
+            max_length=99,
+        )
+        prompt = "Hello, how are you?"
+        expected_body = {
+            "messages": [{"role": "user", "content": "Hello, how are you?"}],
+            "max_tokens": 50,
+            "stop_sequences": ["CUSTOM_STOP"],
+            "temperature": 0.7,
+            "top_p": 0.8,
+            "top_k": 5,
+            "system": "system prompt",
+            "anthropic_version": "custom_version",
+        }
+
+        body = layer.prepare_body(prompt)
+
+        assert body == expected_body
+
+    def test_prepare_body_with_model_kwargs_and_custom_inference_params(self) -> None:
+        layer = AnthropicClaudeAdapter(
+            model_kwargs={
+                "temperature": 0.6,
+                "top_p": 0.7,
+                "top_k": 4,
+                "max_tokens": 49,
+                "stop_sequences": ["CUSTOM_STOP_MODEL_KWARGS"],
+                "system": "system prompt",
+                "anthropic_version": "custom_version",
+            },
+            max_length=99,
+        )
+        prompt = "Hello, how are you?"
+        expected_body = {
+            "messages": [{"role": "user", "content": "Hello, how are you?"}],
+            "max_tokens": 50,
+            "stop_sequences": ["CUSTOM_STOP_MODEL_KWARGS"],
+            "temperature": 0.7,
+            "top_p": 0.8,
+            "top_k": 5,
+            "system": "new system prompt",
+            "anthropic_version": "new_custom_version",
+        }
+
+        body = layer.prepare_body(
+            prompt,
+            temperature=0.7,
+            top_p=0.8,
+            top_k=5,
+            max_tokens=50,
+            system="new system prompt",
+            anthropic_version="new_custom_version",
+        )
+
+        assert body == expected_body
+
+    def test_get_responses(self) -> None:
+        adapter = AnthropicClaudeAdapter(model_kwargs={}, max_length=99)
+        response_body = {"content": [{"text": "This is a single response."}]}
+        expected_responses = ["This is a single response."]
+        assert adapter.get_responses(response_body) == expected_responses
+
+    def test_get_responses_leading_whitespace(self) -> None:
+        adapter = AnthropicClaudeAdapter(model_kwargs={}, max_length=99)
+        response_body = {"content": [{"text": "\n\t This is a single response."}]}
+        expected_responses = ["This is a single response."]
+        assert adapter.get_responses(response_body) == expected_responses
+
+    def test_get_stream_responses(self) -> None:
+        stream_mock = MagicMock()
+        streaming_callback_mock = MagicMock()
+
+        stream_mock.__iter__.return_value = [
+            {"chunk": {"bytes": b'{"delta": {"text": " This"}}'}},
+            {"chunk": {"bytes": b'{"delta": {"text": " is"}}'}},
+            {"chunk": {"bytes": b'{"delta": {"text": " a"}}'}},
+            {"chunk": {"bytes": b'{"delta": {"text": " single"}}'}},
+            {"chunk": {"bytes": b'{"delta": {"text": " response."}}'}},
+        ]
+
+        adapter = AnthropicClaudeAdapter(model_kwargs={}, max_length=99)
+        expected_responses = ["This is a single response."]
+        assert adapter.get_stream_responses(stream_mock, streaming_callback_mock) == expected_responses
+
+        streaming_callback_mock.assert_has_calls(
+            [
+                call(StreamingChunk(content=" This", meta={"delta": {"text": " This"}})),
+                call(StreamingChunk(content=" is", meta={"delta": {"text": " is"}})),
+                call(StreamingChunk(content=" a", meta={"delta": {"text": " a"}})),
+                call(StreamingChunk(content=" single", meta={"delta": {"text": " single"}})),
+                call(StreamingChunk(content=" response.", meta={"delta": {"text": " response."}})),
+            ]
+        )
+
+    def test_get_stream_responses_empty(self) -> None:
+        stream_mock = MagicMock()
+        streaming_callback_mock = MagicMock()
+
+        stream_mock.__iter__.return_value = []
+
+        adapter = AnthropicClaudeAdapter(model_kwargs={}, max_length=99)
+        expected_responses = [""]
+        assert adapter.get_stream_responses(stream_mock, streaming_callback_mock) == expected_responses
+
+        streaming_callback_mock.assert_not_called()
+
+
+class TestAnthropicClaudeAdapterNoMessagesAPI:
+    def test_prepare_body_with_default_params(self) -> None:
+        layer = AnthropicClaudeAdapter(model_kwargs={"use_messages_api": False}, max_length=99)
         prompt = "Hello, how are you?"
         expected_body = {
             "prompt": "\n\nHuman: Hello, how are you?\n\nAssistant:",
@@ -239,7 +452,7 @@ class TestAnthropicClaudeAdapter:
         assert body == expected_body
 
     def test_prepare_body_with_custom_inference_params(self) -> None:
-        layer = AnthropicClaudeAdapter(model_kwargs={}, max_length=99)
+        layer = AnthropicClaudeAdapter(model_kwargs={"use_messages_api": False}, max_length=99)
         prompt = "Hello, how are you?"
         expected_body = {
             "prompt": "\n\nHuman: Hello, how are you?\n\nAssistant:",
@@ -265,6 +478,7 @@ class TestAnthropicClaudeAdapter:
     def test_prepare_body_with_model_kwargs(self) -> None:
         layer = AnthropicClaudeAdapter(
             model_kwargs={
+                "use_messages_api": False,
                 "temperature": 0.7,
                 "top_p": 0.8,
                 "top_k": 5,
@@ -291,6 +505,7 @@ class TestAnthropicClaudeAdapter:
     def test_prepare_body_with_model_kwargs_and_custom_inference_params(self) -> None:
         layer = AnthropicClaudeAdapter(
             model_kwargs={
+                "use_messages_api": False,
                 "temperature": 0.6,
                 "top_p": 0.7,
                 "top_k": 4,
@@ -314,20 +529,20 @@ class TestAnthropicClaudeAdapter:
         assert body == expected_body
 
     def test_get_responses(self) -> None:
-        adapter = AnthropicClaudeAdapter(model_kwargs={}, max_length=99)
+        adapter = AnthropicClaudeAdapter(model_kwargs={"use_messages_api": False}, max_length=99)
         response_body = {"completion": "This is a single response."}
         expected_responses = ["This is a single response."]
         assert adapter.get_responses(response_body) == expected_responses
 
     def test_get_responses_leading_whitespace(self) -> None:
-        adapter = AnthropicClaudeAdapter(model_kwargs={}, max_length=99)
+        adapter = AnthropicClaudeAdapter(model_kwargs={"use_messages_api": False}, max_length=99)
         response_body = {"completion": "\n\t This is a single response."}
         expected_responses = ["This is a single response."]
         assert adapter.get_responses(response_body) == expected_responses
 
     def test_get_stream_responses(self) -> None:
         stream_mock = MagicMock()
-        stream_handler_mock = MagicMock()
+        streaming_callback_mock = MagicMock()
 
         stream_mock.__iter__.return_value = [
             {"chunk": {"bytes": b'{"completion": " This"}'}},
@@ -337,35 +552,31 @@ class TestAnthropicClaudeAdapter:
             {"chunk": {"bytes": b'{"completion": " response."}'}},
         ]
 
-        stream_handler_mock.side_effect = lambda token_received, **kwargs: token_received
-
-        adapter = AnthropicClaudeAdapter(model_kwargs={}, max_length=99)
+        adapter = AnthropicClaudeAdapter(model_kwargs={"use_messages_api": False}, max_length=99)
         expected_responses = ["This is a single response."]
-        assert adapter.get_stream_responses(stream_mock, stream_handler_mock) == expected_responses
+        assert adapter.get_stream_responses(stream_mock, streaming_callback_mock) == expected_responses
 
-        stream_handler_mock.assert_has_calls(
+        streaming_callback_mock.assert_has_calls(
             [
-                call(" This", event_data={"completion": " This"}),
-                call(" is", event_data={"completion": " is"}),
-                call(" a", event_data={"completion": " a"}),
-                call(" single", event_data={"completion": " single"}),
-                call(" response.", event_data={"completion": " response."}),
+                call(StreamingChunk(content=" This", meta={"completion": " This"})),
+                call(StreamingChunk(content=" is", meta={"completion": " is"})),
+                call(StreamingChunk(content=" a", meta={"completion": " a"})),
+                call(StreamingChunk(content=" single", meta={"completion": " single"})),
+                call(StreamingChunk(content=" response.", meta={"completion": " response."})),
             ]
         )
 
     def test_get_stream_responses_empty(self) -> None:
         stream_mock = MagicMock()
-        stream_handler_mock = MagicMock()
+        streaming_callback_mock = MagicMock()
 
         stream_mock.__iter__.return_value = []
 
-        stream_handler_mock.side_effect = lambda token_received, **kwargs: token_received
-
-        adapter = AnthropicClaudeAdapter(model_kwargs={}, max_length=99)
+        adapter = AnthropicClaudeAdapter(model_kwargs={"use_messages_api": False}, max_length=99)
         expected_responses = [""]
-        assert adapter.get_stream_responses(stream_mock, stream_handler_mock) == expected_responses
+        assert adapter.get_stream_responses(stream_mock, streaming_callback_mock) == expected_responses
 
-        stream_handler_mock.assert_not_called()
+        streaming_callback_mock.assert_not_called()
 
 
 class TestMistralAdapter:
@@ -460,7 +671,7 @@ class TestMistralAdapter:
 
     def test_get_stream_responses(self) -> None:
         stream_mock = MagicMock()
-        stream_handler_mock = MagicMock()
+        streaming_callback_mock = MagicMock()
 
         stream_mock.__iter__.return_value = [
             {"chunk": {"bytes": b'{"outputs": [{"text": " This"}]}'}},
@@ -470,35 +681,33 @@ class TestMistralAdapter:
             {"chunk": {"bytes": b'{"outputs": [{"text": " response."}]}'}},
         ]
 
-        stream_handler_mock.side_effect = lambda token_received, **kwargs: token_received
-
         adapter = MistralAdapter(model_kwargs={}, max_length=99)
         expected_responses = ["This is a single response."]
-        assert adapter.get_stream_responses(stream_mock, stream_handler_mock) == expected_responses
+        assert adapter.get_stream_responses(stream_mock, streaming_callback_mock) == expected_responses
 
-        stream_handler_mock.assert_has_calls(
+        streaming_callback_mock.assert_has_calls(
             [
-                call(" This", event_data={"outputs": [{"text": " This"}]}),
-                call(" is", event_data={"outputs": [{"text": " is"}]}),
-                call(" a", event_data={"outputs": [{"text": " a"}]}),
-                call(" single", event_data={"outputs": [{"text": " single"}]}),
-                call(" response.", event_data={"outputs": [{"text": " response."}]}),
+                call(StreamingChunk(content=" This", meta={"outputs": [{"text": " This"}]})),
+                call(StreamingChunk(content=" is", meta={"outputs": [{"text": " is"}]})),
+                call(StreamingChunk(content=" a", meta={"outputs": [{"text": " a"}]})),
+                call(StreamingChunk(content=" single", meta={"outputs": [{"text": " single"}]})),
+                call(StreamingChunk(content=" response.", meta={"outputs": [{"text": " response."}]})),
             ]
         )
 
     def test_get_stream_responses_empty(self) -> None:
         stream_mock = MagicMock()
-        stream_handler_mock = MagicMock()
+        streaming_callback_mock = MagicMock()
 
         stream_mock.__iter__.return_value = []
 
-        stream_handler_mock.side_effect = lambda token_received, **kwargs: token_received
+        streaming_callback_mock.side_effect = lambda token_received, **kwargs: token_received
 
         adapter = MistralAdapter(model_kwargs={}, max_length=99)
         expected_responses = [""]
-        assert adapter.get_stream_responses(stream_mock, stream_handler_mock) == expected_responses
+        assert adapter.get_stream_responses(stream_mock, streaming_callback_mock) == expected_responses
 
-        stream_handler_mock.assert_not_called()
+        streaming_callback_mock.assert_not_called()
 
 
 class TestCohereCommandAdapter:
@@ -655,7 +864,7 @@ class TestCohereCommandAdapter:
 
     def test_get_stream_responses(self) -> None:
         stream_mock = MagicMock()
-        stream_handler_mock = MagicMock()
+        streaming_callback_mock = MagicMock()
 
         stream_mock.__iter__.return_value = [
             {"chunk": {"bytes": b'{"text": " This"}'}},
@@ -666,36 +875,140 @@ class TestCohereCommandAdapter:
             {"chunk": {"bytes": b'{"finish_reason": "MAX_TOKENS", "is_finished": true}'}},
         ]
 
-        stream_handler_mock.side_effect = lambda token_received, **kwargs: token_received
-
         adapter = CohereCommandAdapter(model_kwargs={}, max_length=99)
         expected_responses = ["This is a single response."]
-        assert adapter.get_stream_responses(stream_mock, stream_handler_mock) == expected_responses
+        assert adapter.get_stream_responses(stream_mock, streaming_callback_mock) == expected_responses
 
-        stream_handler_mock.assert_has_calls(
+        streaming_callback_mock.assert_has_calls(
             [
-                call(" This", event_data={"text": " This"}),
-                call(" is", event_data={"text": " is"}),
-                call(" a", event_data={"text": " a"}),
-                call(" single", event_data={"text": " single"}),
-                call(" response.", event_data={"text": " response."}),
-                call("", event_data={"finish_reason": "MAX_TOKENS", "is_finished": True}),
+                call(StreamingChunk(content=" This", meta={"text": " This"})),
+                call(StreamingChunk(content=" is", meta={"text": " is"})),
+                call(StreamingChunk(content=" a", meta={"text": " a"})),
+                call(StreamingChunk(content=" single", meta={"text": " single"})),
+                call(StreamingChunk(content=" response.", meta={"text": " response."})),
+                call(StreamingChunk(content="", meta={"finish_reason": "MAX_TOKENS", "is_finished": True})),
             ]
         )
 
     def test_get_stream_responses_empty(self) -> None:
         stream_mock = MagicMock()
-        stream_handler_mock = MagicMock()
+        streaming_callback_mock = MagicMock()
 
         stream_mock.__iter__.return_value = []
 
-        stream_handler_mock.side_effect = lambda token_received, **kwargs: token_received
-
         adapter = CohereCommandAdapter(model_kwargs={}, max_length=99)
         expected_responses = [""]
-        assert adapter.get_stream_responses(stream_mock, stream_handler_mock) == expected_responses
+        assert adapter.get_stream_responses(stream_mock, streaming_callback_mock) == expected_responses
 
-        stream_handler_mock.assert_not_called()
+        streaming_callback_mock.assert_not_called()
+
+
+class TestCohereCommandRAdapter:
+    def test_prepare_body(self) -> None:
+        adapter = CohereCommandRAdapter(
+            model_kwargs={
+                "chat_history": [
+                    {"role": "CHATBOT", "content": "How can I help you today?"},
+                ],
+                "documents": [
+                    {"title": "France", "snippet": "Paris is the capital of France."},
+                    {"title": "Germany", "snippet": "Berlin is the capital of Germany."},
+                ],
+                "search_query_only": False,
+                "preamble": "preamble",
+                "temperature": 0,
+                "p": 0.9,
+                "k": 50,
+                "prompt_truncation": "AUTO_PRESERVE_ORDER",
+                "frequency_penalty": 0.3,
+                "presence_penalty": 0.4,
+                "seed": 42,
+                "return_prompt": True,
+                "tools": [
+                    {
+                        "name": "query_daily_sales_report",
+                        "description": "Connects to a database to retrieve overall sales volumes and sales "
+                        "information for a given day.",
+                        "parameter_definitions": {
+                            "day": {
+                                "description": "Retrieves sales data for this day, formatted as YYYY-MM-DD.",
+                                "type": "str",
+                                "required": True,
+                            }
+                        },
+                    }
+                ],
+                "tool_results": [
+                    {
+                        "call": {"name": "query_daily_sales_report", "parameters": {"day": "2023-09-29"}},
+                        "outputs": [
+                            {"date": "2023-09-29", "summary": "Total Sales Amount: 10000, Total Units Sold: 250"}
+                        ],
+                    }
+                ],
+                "stop_sequences": ["\n\n"],
+                "raw_prompting": True,
+                "stream": True,
+                "unknown_arg": "unknown_arg",
+            },
+            max_length=100,
+        )
+        body = adapter.prepare_body(prompt="test")
+        assert body == {
+            "message": "test",
+            "chat_history": [
+                {"role": "CHATBOT", "content": "How can I help you today?"},
+            ],
+            "documents": [
+                {"title": "France", "snippet": "Paris is the capital of France."},
+                {"title": "Germany", "snippet": "Berlin is the capital of Germany."},
+            ],
+            "search_query_only": False,
+            "preamble": "preamble",
+            "max_tokens": 100,
+            "temperature": 0,
+            "p": 0.9,
+            "k": 50,
+            "prompt_truncation": "AUTO_PRESERVE_ORDER",
+            "frequency_penalty": 0.3,
+            "presence_penalty": 0.4,
+            "seed": 42,
+            "return_prompt": True,
+            "tools": [
+                {
+                    "name": "query_daily_sales_report",
+                    "description": "Connects to a database to retrieve overall sales volumes and sales "
+                    "information for a given day.",
+                    "parameter_definitions": {
+                        "day": {
+                            "description": "Retrieves sales data for this day, formatted as YYYY-MM-DD.",
+                            "type": "str",
+                            "required": True,
+                        }
+                    },
+                }
+            ],
+            "tool_results": [
+                {
+                    "call": {"name": "query_daily_sales_report", "parameters": {"day": "2023-09-29"}},
+                    "outputs": [{"date": "2023-09-29", "summary": "Total Sales Amount: 10000, Total Units Sold: 250"}],
+                }
+            ],
+            "stop_sequences": ["\n\n"],
+            "raw_prompting": True,
+        }
+
+    def test_extract_completions_from_response(self) -> None:
+        adapter = CohereCommandRAdapter(model_kwargs={}, max_length=100)
+        response_body = {"text": "response"}
+        completions = adapter._extract_completions_from_response(response_body=response_body)
+        assert completions == ["response"]
+
+    def test_build_chunk(self) -> None:
+        adapter = CohereCommandRAdapter(model_kwargs={}, max_length=100)
+        chunk = {"text": "response_token"}
+        streaming_chunk = adapter._build_streaming_chunk(chunk=chunk)
+        assert streaming_chunk == StreamingChunk(content="response_token", meta=chunk)
 
 
 class TestAI21LabsJurassic2Adapter:
@@ -954,7 +1267,7 @@ class TestAmazonTitanAdapter:
 
     def test_get_stream_responses(self) -> None:
         stream_mock = MagicMock()
-        stream_handler_mock = MagicMock()
+        streaming_callback_mock = MagicMock()
 
         stream_mock.__iter__.return_value = [
             {"chunk": {"bytes": b'{"outputText": " This"}'}},
@@ -964,40 +1277,36 @@ class TestAmazonTitanAdapter:
             {"chunk": {"bytes": b'{"outputText": " response."}'}},
         ]
 
-        stream_handler_mock.side_effect = lambda token_received, **kwargs: token_received
-
         adapter = AmazonTitanAdapter(model_kwargs={}, max_length=99)
         expected_responses = ["This is a single response."]
-        assert adapter.get_stream_responses(stream_mock, stream_handler_mock) == expected_responses
+        assert adapter.get_stream_responses(stream_mock, streaming_callback_mock) == expected_responses
 
-        stream_handler_mock.assert_has_calls(
+        streaming_callback_mock.assert_has_calls(
             [
-                call(" This", event_data={"outputText": " This"}),
-                call(" is", event_data={"outputText": " is"}),
-                call(" a", event_data={"outputText": " a"}),
-                call(" single", event_data={"outputText": " single"}),
-                call(" response.", event_data={"outputText": " response."}),
+                call(StreamingChunk(content=" This", meta={"outputText": " This"})),
+                call(StreamingChunk(content=" is", meta={"outputText": " is"})),
+                call(StreamingChunk(content=" a", meta={"outputText": " a"})),
+                call(StreamingChunk(content=" single", meta={"outputText": " single"})),
+                call(StreamingChunk(content=" response.", meta={"outputText": " response."})),
             ]
         )
 
     def test_get_stream_responses_empty(self) -> None:
         stream_mock = MagicMock()
-        stream_handler_mock = MagicMock()
+        streaming_callback_mock = MagicMock()
 
         stream_mock.__iter__.return_value = []
 
-        stream_handler_mock.side_effect = lambda token_received, **kwargs: token_received
-
         adapter = AmazonTitanAdapter(model_kwargs={}, max_length=99)
         expected_responses = [""]
-        assert adapter.get_stream_responses(stream_mock, stream_handler_mock) == expected_responses
+        assert adapter.get_stream_responses(stream_mock, streaming_callback_mock) == expected_responses
 
-        stream_handler_mock.assert_not_called()
+        streaming_callback_mock.assert_not_called()
 
 
-class TestMetaLlama2ChatAdapter:
+class TestMetaLlamaAdapter:
     def test_prepare_body_with_default_params(self) -> None:
-        layer = MetaLlama2ChatAdapter(model_kwargs={}, max_length=99)
+        layer = MetaLlamaAdapter(model_kwargs={}, max_length=99)
         prompt = "Hello, how are you?"
         expected_body = {"prompt": "Hello, how are you?", "max_gen_len": 99}
 
@@ -1006,7 +1315,7 @@ class TestMetaLlama2ChatAdapter:
         assert body == expected_body
 
     def test_prepare_body_with_custom_inference_params(self) -> None:
-        layer = MetaLlama2ChatAdapter(model_kwargs={}, max_length=99)
+        layer = MetaLlamaAdapter(model_kwargs={}, max_length=99)
         prompt = "Hello, how are you?"
         expected_body = {
             "prompt": "Hello, how are you?",
@@ -1026,7 +1335,7 @@ class TestMetaLlama2ChatAdapter:
         assert body == expected_body
 
     def test_prepare_body_with_model_kwargs(self) -> None:
-        layer = MetaLlama2ChatAdapter(
+        layer = MetaLlamaAdapter(
             model_kwargs={
                 "temperature": 0.7,
                 "top_p": 0.8,
@@ -1048,7 +1357,7 @@ class TestMetaLlama2ChatAdapter:
         assert body == expected_body
 
     def test_prepare_body_with_model_kwargs_and_custom_inference_params(self) -> None:
-        layer = MetaLlama2ChatAdapter(
+        layer = MetaLlamaAdapter(
             model_kwargs={
                 "temperature": 0.6,
                 "top_p": 0.7,
@@ -1070,20 +1379,20 @@ class TestMetaLlama2ChatAdapter:
         assert body == expected_body
 
     def test_get_responses(self) -> None:
-        adapter = MetaLlama2ChatAdapter(model_kwargs={}, max_length=99)
+        adapter = MetaLlamaAdapter(model_kwargs={}, max_length=99)
         response_body = {"generation": "This is a single response."}
         expected_responses = ["This is a single response."]
         assert adapter.get_responses(response_body) == expected_responses
 
     def test_get_responses_leading_whitespace(self) -> None:
-        adapter = MetaLlama2ChatAdapter(model_kwargs={}, max_length=99)
+        adapter = MetaLlamaAdapter(model_kwargs={}, max_length=99)
         response_body = {"generation": "\n\t This is a single response."}
         expected_responses = ["This is a single response."]
         assert adapter.get_responses(response_body) == expected_responses
 
     def test_get_stream_responses(self) -> None:
         stream_mock = MagicMock()
-        stream_handler_mock = MagicMock()
+        streaming_callback_mock = MagicMock()
 
         stream_mock.__iter__.return_value = [
             {"chunk": {"bytes": b'{"generation": " This"}'}},
@@ -1093,32 +1402,28 @@ class TestMetaLlama2ChatAdapter:
             {"chunk": {"bytes": b'{"generation": " response."}'}},
         ]
 
-        stream_handler_mock.side_effect = lambda token_received, **kwargs: token_received
-
-        adapter = MetaLlama2ChatAdapter(model_kwargs={}, max_length=99)
+        adapter = MetaLlamaAdapter(model_kwargs={}, max_length=99)
         expected_responses = ["This is a single response."]
-        assert adapter.get_stream_responses(stream_mock, stream_handler_mock) == expected_responses
+        assert adapter.get_stream_responses(stream_mock, streaming_callback_mock) == expected_responses
 
-        stream_handler_mock.assert_has_calls(
+        streaming_callback_mock.assert_has_calls(
             [
-                call(" This", event_data={"generation": " This"}),
-                call(" is", event_data={"generation": " is"}),
-                call(" a", event_data={"generation": " a"}),
-                call(" single", event_data={"generation": " single"}),
-                call(" response.", event_data={"generation": " response."}),
+                call(StreamingChunk(content=" This", meta={"generation": " This"})),
+                call(StreamingChunk(content=" is", meta={"generation": " is"})),
+                call(StreamingChunk(content=" a", meta={"generation": " a"})),
+                call(StreamingChunk(content=" single", meta={"generation": " single"})),
+                call(StreamingChunk(content=" response.", meta={"generation": " response."})),
             ]
         )
 
     def test_get_stream_responses_empty(self) -> None:
         stream_mock = MagicMock()
-        stream_handler_mock = MagicMock()
+        streaming_callback_mock = MagicMock()
 
         stream_mock.__iter__.return_value = []
 
-        stream_handler_mock.side_effect = lambda token_received, **kwargs: token_received
-
-        adapter = MetaLlama2ChatAdapter(model_kwargs={}, max_length=99)
+        adapter = MetaLlamaAdapter(model_kwargs={}, max_length=99)
         expected_responses = [""]
-        assert adapter.get_stream_responses(stream_mock, stream_handler_mock) == expected_responses
+        assert adapter.get_stream_responses(stream_mock, streaming_callback_mock) == expected_responses
 
-        stream_handler_mock.assert_not_called()
+        streaming_callback_mock.assert_not_called()
